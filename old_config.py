@@ -10,7 +10,7 @@ CONFIG = {
     "output_dir": "output_model",
     "time_step_minutes": 30,
     "period_start": "2019-07-07T00:00:00",
-    "period_end": "2019-07-07T23:30:00",
+    "period_end": "2019-07-31T23:30:00",
     "kt": -0.0065,
     "asl": 1.7813, "bsl": 2067.6,
     "kSS": 0.33745, "kT2m": 0.00838, "kTa": -0.00112, "c_alpha": 0.13469,
