@@ -48,7 +48,7 @@ CONFIG = {
     "output_dir": "output_model",
     "time_step_minutes": 30,
     "period_start": "2019-07-07T00:00:00",
-    "period_end": "2019-07-07T23:30:00",
+    "period_end": "2019-08-31T23:30:00",
     "kt": -0.0065,
     "asl": 1.7813, "bsl": 2067.6,
     "kSS": 0.33745, "kT2m": 0.00838, "kTa": -0.00112, "c_alpha": 0.13469,
@@ -310,16 +310,14 @@ def is_night_time_corrected(time_decimal):
     return time_decimal < sunrise or time_decimal > sunset
 
 
-def calculate_solar_radiation_with_excel_pattern(points_gdf, datetime_obj):
+def calculate_solar_radiation_with_excel_pattern(points_gdf, datetime_obj, aws_data):
     """
     Расчет солнечной радиации G(z,t) по точному шаблону из Excel
     Используем реальные значения из предоставленных данных
     """
     try:
-        time_decimal = datetime_obj.hour + datetime_obj.minute / 60.0
+        time_decimal = round(datetime_obj.hour + datetime_obj.minute / 60.0, 2)
 
-        # ТОЧНЫЕ значения G для точки 94 из Excel (для калибровки)
-        # Эти значения соответствуют r.sun (глобальной радиации)
         excel_g_values_94 = {
             0.0: 0.0, 0.5: 0.0, 1.0: 0.0, 1.5: 0.0, 2.0: 0.0, 2.5: 0.0, 3.0: 0.0,
             3.5: 12.9, 4.0: 22.8, 4.5: 32.7, 5.0: 42.4, 5.5: 51.6, 6.0: 60.1,
@@ -332,7 +330,7 @@ def calculate_solar_radiation_with_excel_pattern(points_gdf, datetime_obj):
             22.0: 0.0, 22.5: 0.0, 23.0: 0.0, 23.5: 0.0
         }
 
-        # Значения для AWS2 (точка 96) из Excel
+        # G для точки AWS2 (точка 96) — r.sun именно в точке метеостанции
         excel_g_values_96 = {
             0.0: 0.0, 0.5: 0.0, 1.0: 0.0, 1.5: 0.0, 2.0: 0.0, 2.5: 0.0, 3.0: 0.0,
             3.5: 13.5, 4.0: 23.9, 4.5: 34.3, 5.0: 44.5, 5.5: 54.2, 6.0: 63.1,
@@ -345,72 +343,38 @@ def calculate_solar_radiation_with_excel_pattern(points_gdf, datetime_obj):
             22.0: 0.0, 22.5: 0.0, 23.0: 0.0, 23.5: 0.0
         }
 
-        # Значения Sin для AWS2 из Excel (входящая коротковолновая радиация)
-        excel_sin_aws2 = {
-            0.0: 0.0, 0.5: 0.0, 1.0: 0.0, 1.5: 0.0, 2.0: 0.0, 2.5: 0.0, 3.0: 0.0,
-            3.5: 0.0, 4.0: 8.5, 4.5: 20.3, 5.0: 76.1, 5.5: 231.9, 6.0: 170.8,
-            6.5: 143.6, 7.0: 138.6, 7.5: 113.1, 8.0: 190.4, 8.5: 270.7, 9.0: 350.4,
-            9.5: 421.8, 10.0: 506.2, 10.5: 632.2, 11.0: 655.0, 11.5: 760.4,
-            12.0: 776.2, 12.5: 870.1, 13.0: 308.7, 13.5: 654.6, 14.0: 267.0,
-            14.5: 267.7, 15.0: 229.1, 15.5: 265.9, 16.0: 418.2, 16.5: 312.4,
-            17.0: 251.8, 17.5: 12.3, 18.0: 94.7, 18.5: 67.6, 19.0: 45.7,
-            19.5: 32.2, 20.0: 23.7, 20.5: 6.8, 21.0: 0.0, 21.5: 0.0,
-            22.0: 0.0, 22.5: 0.0, 23.0: 0.0, 23.5: 0.0
-        }
+        # Интерполяция G_cell (точка 94 — эталон)
+        hours_94 = sorted(excel_g_values_94.keys())
+        vals_94 = [excel_g_values_94[h] for h in hours_94]
+        g_cell_base = float(np.interp(time_decimal, hours_94, vals_94))
 
-        # Для остальных точек создаем реалистичные вариации
+        # Интерполяция G_AWS2 (точка 96 — метеостанция)
+        hours_96 = sorted(excel_g_values_96.keys())
+        vals_96 = [excel_g_values_96[h] for h in hours_96]
+        g_aws2 = float(np.interp(time_decimal, hours_96, vals_96))
+
+        # Реальное Sin_AWS2 из метеоданных (меняется каждый день!)
+        sin_aws2 = aws_data['Sin_AWS2']
+
         radiation_values = {}
 
         for idx, point in points_gdf.iterrows():
             cat = point['cat']
 
-            # Получаем базовые значения для времени
-            if time_decimal in excel_g_values_94:
-                base_g_94 = excel_g_values_94[time_decimal]
-                base_g_96 = excel_g_values_96[time_decimal]
-                sin_aws2 = excel_sin_aws2[time_decimal]
-            else:
-                # Интерполяция для промежуточных времен
-                hours = list(excel_g_values_94.keys())
-                g_94_values = list(excel_g_values_94.values())
-                g_96_values = list(excel_g_values_96.values())
-                sin_aws2_values = list(excel_sin_aws2.values())
-
-                base_g_94 = np.interp(time_decimal, hours, g_94_values)
-                base_g_96 = np.interp(time_decimal, hours, g_96_values)
-                sin_aws2 = np.interp(time_decimal, hours, sin_aws2_values)
-
-            if cat == 94:
-                # Точка 94 - используем точные значения из Excel для G
-                g_value = base_g_94
-                g_aws2_value = base_g_96
-                sin_aws2_value = sin_aws2
-            elif cat == 96:
-                # Точка AWS2 (96) - используем значения для AWS2
-                g_value = base_g_96
-                g_aws2_value = base_g_96
-                sin_aws2_value = sin_aws2
-            else:
-                # Для других точек создаем вариации на основе точки 94
-                # Вариации зависят от высоты и положения точки
-                height_factor = 1.0 + (point['z'] - 2560) / 1000 * 0.1
-                position_factor = 0.9 + 0.2 * (cat % 10) / 10
-                variation = height_factor * position_factor
-
-                g_value = base_g_94 * variation
-                g_aws2_value = base_g_96
-                sin_aws2_value = sin_aws2
+            # Небольшая поправка G_cell по высоте точки
+            height_factor = 1.0 + (point['z'] - 2560) / 1000 * 0.05
+            g_cell = g_cell_base * height_factor
 
             radiation_values[cat] = {
-                'G_cell': g_value,
-                'G_AWS2': g_aws2_value,
-                'Sin_AWS2': sin_aws2_value
+                'G_cell': g_cell,
+                'G_AWS2': g_aws2,  # ← ФИКС: реальное значение r.sun для AWS2
+                'Sin_AWS2': sin_aws2  # ← ФИКС: реальное значение из метеоданных
             }
 
         return radiation_values
 
     except Exception as e:
-        print(f"✗ Ошибка расчета радиации по шаблону Excel: {e}")
+        print(f"✗ Ошибка расчета радиации: {e}")
         return {}
 
 
@@ -435,30 +399,13 @@ def compute_Sin_cell_corrected(Sin_AWS2, G_cell, G_AWS2):
     2. Если G_cell близко к 0 (точка в тени)
     3. Ночные условия
     """
-    # Если ночь или оба значения G близки к 0
-    if Sin_AWS2 < 1.0:
+    if G_AWS2 <= 0.1 or Sin_AWS2 <= 0:
         return 0.0
 
-    # Если G_AWS2 очень маленькое (близко к 0), но есть Sin_AWS2
-    if G_AWS2 < 0.1:
-        # Это случай сумерек/рассеянного света
-        # Используем пропорцию на основе высоты солнца
-        if G_cell > 0.1:
-            # Точка получает прямой свет, а AWS2 - только рассеянный
-            # Используем эмпирическую формулу
-            return Sin_AWS2 * 0.3  # 30% от измеренного на AWS2
-        else:
-            # Обе точки в тени/ночи
-            return 0.0
-
-    # Нормальный расчет по формуле
+        # САМАЯ ПРОСТАЯ ФОРМУЛА
     sin_cell = Sin_AWS2 * (G_cell / G_AWS2)
 
-    # Ограничиваем максимальное значение (не может быть больше Sin_AWS2 более чем в 1.5 раза)
-    max_sin = Sin_AWS2 * 1.5
-    if sin_cell > max_sin:
-        sin_cell = max_sin
-
+    # Не делаем никаких дополнительных проверок!
     return max(0.0, sin_cell)
 
 
@@ -690,10 +637,9 @@ def compute_ablation_corrected(Qm, ST, time_step_seconds, rho_snow, rho_ice, L_f
 # ==================== СОЗДАНИЕ ТОЧЕК ИССЛЕДОВАНИЯ ====================
 def create_research_points(dem_tif, glacier_shp, num_points=100):
     """
-    ПРАВИЛЬНОЕ создание точек из центроидов ячеек DEM.
-    Обязательно включаем точку 94 и 96 (AWS2).
+    ИСПРАВЛЕНО: Шаг перебора 1, чтобы найти все 100 точек.
     """
-    print("Создаем точки с фиксированной точкой 94 и 96 (AWS2)...")
+    print(f"Создаем точки (цель: {num_points} шт) с фиксированными 94 и 96...")
 
     try:
         with rasterio.open(dem_tif) as src:
@@ -703,67 +649,79 @@ def create_research_points(dem_tif, glacier_shp, num_points=100):
 
             points = []
 
-            # Вспомогательная функция для добавления спец. точки
-            def add_special_point(target_x, target_y, target_z_approx, cat_id):
-                # Ищем ближайшую ячейку к целевым координатам
+            # --- Вспомогательная функция ---
+            def add_special_point(target_x, target_y, cat_id):
+                # Ищем ближайшую ячейку (грубый поиск)
                 closest_dist = float('inf')
                 closest_cell = None
 
-                # Шаг 5 для ускорения поиска, если растр большой
-                for j in range(0, src.height, 5):
-                    for i in range(0, src.width, 5):
+                # Используем шаг 10 для быстрого поиска области
+                for j in range(0, src.height, 10):
+                    for i in range(0, src.width, 10):
                         x, y = src.xy(j, i)
                         dist = np.sqrt((x - target_x) ** 2 + (y - target_y) ** 2)
-
                         if dist < closest_dist:
                             closest_dist = dist
-                            closest_cell = (i, j, x, y)
+                            closest_cell = (i, j)
 
+                # Точный поиск вокруг найденной области
                 if closest_cell:
-                    i, j, x, y = closest_cell
-                    window = rasterio.windows.Window(i, j, 1, 1)
-                    z = src.read(1, window=window)[0, 0]
+                    ci, cj = closest_cell
+                    best_cell = None
+                    best_dist = float('inf')
+                    for j in range(max(0, cj - 15), min(src.height, cj + 15)):
+                        for i in range(max(0, ci - 15), min(src.width, ci + 15)):
+                            x, y = src.xy(j, i)
+                            dist = np.sqrt((x - target_x) ** 2 + (y - target_y) ** 2)
+                            if dist < best_dist:
+                                best_dist = dist
+                                best_cell = (i, j, x, y)
 
-                    if z > -9999:  # проверка на nodata
-                        point = gpd.points_from_xy([x], [y])[0]
-                        return {
-                            'cat': cat_id,
-                            'x': x, 'y': y, 'z': z,
-                            'row': j, 'col': i,
-                            'geometry': point
-                        }
+                    if best_cell:
+                        i, j, x, y = best_cell
+                        # Читаем высоту
+                        window = rasterio.windows.Window(i, j, 1, 1)
+                        z = src.read(1, window=window)[0, 0]
+                        if z > -9999:
+                            point_geom = gpd.points_from_xy([x], [y])[0]
+                            return {
+                                'cat': cat_id, 'x': x, 'y': y, 'z': z,
+                                'row': j, 'col': i, 'geometry': point_geom
+                            }
                 return None
 
-            # 1. Добавляем точку 94 (из Excel примера)
-            p94 = add_special_point(525285, 6300765, 2563, 94)
+            # 1. Добавляем точку 94
+            p94 = add_special_point(525285, 6300765, 94)
             if p94: points.append(p94)
 
-            # 2. Добавляем точку 96 (AWS2 - координаты примерно там же, возьмем смещение)
-            p96 = add_special_point(525290, 6300770, 2561, 96)
+            # 2. Добавляем точку 96 (AWS2)
+            p96 = add_special_point(525290, 6300770, 96)
             if p96: points.append(p96)
 
-            # 3. Добавляем остальные точки
+            # 3. Добавляем остальные точки (шаг 1!)
             cat_counter = 1
-            for j in range(0, src.height, 2):  # Шаг 2 для скорости
-                for i in range(0, src.width, 2):
-                    if cat_counter in [94, 96]:  # Пропускаем, т.к. уже добавили
+
+            # ВАЖНО: шаг 1, а не 2, чтобы собрать все точки
+            for j in range(0, src.height, 1):
+                for i in range(0, src.width, 1):
+                    # Пропускаем номера, занятые спец. точками
+                    while cat_counter == 94 or cat_counter == 96:
                         cat_counter += 1
-                        continue
 
                     x, y = src.xy(j, i)
-                    point = gpd.points_from_xy([x], [y])[0]
+                    point_geom = gpd.points_from_xy([x], [y])[0]
 
-                    if glacier_gdf.contains(point).any():
+                    # Проверка попадания в ледник
+                    if glacier_gdf.contains(point_geom).any():
                         window = rasterio.windows.Window(i, j, 1, 1)
-                        data = src.read(1, window=window)
-                        z = data[0, 0]
+                        z = src.read(1, window=window)[0, 0]
 
                         if not np.isnan(z) and z > -9999:
                             points.append({
                                 'cat': cat_counter,
                                 'x': x, 'y': y, 'z': z,
                                 'row': j, 'col': i,
-                                'geometry': point
+                                'geometry': point_geom
                             })
                             cat_counter += 1
 
@@ -773,11 +731,13 @@ def create_research_points(dem_tif, glacier_shp, num_points=100):
                     break
 
             points_gdf = gpd.GeoDataFrame(points, crs=src.crs)
-            print(f"✓ Создано {len(points_gdf)} точек (включая cat 94 и 96)")
+            print(f"✓ Успешно создано точек: {len(points_gdf)}")
             return points_gdf
 
     except Exception as e:
-        print(f"✗ Ошибка: {e}")
+        print(f"✗ Ошибка создания точек: {e}")
+        import traceback
+        traceback.print_exc()
         return gpd.GeoDataFrame()
 
 
@@ -862,10 +822,17 @@ def get_aws_data_at_time(aws_df, target_datetime):
 
         # Значения из Excel для калибровки
         # В Excel обычно G рассчитывается как Sin/alpha
-        if aws_data['alpha_AWS2'] > 0:
+        if aws_data['alpha_AWS2'] > 0 and aws_data['alpha_AWS2'] <= 1.0:
             aws_data['G_AWS2'] = aws_data['Sin_AWS2'] / aws_data['alpha_AWS2']
         else:
             aws_data['G_AWS2'] = 887.7  # Значение по умолчанию из примера
+
+            # Масштабируем Sin по времени суток
+            hour = target_datetime.hour
+            if 4 <= hour <= 20:
+                aws_data['G_AWS2'] = aws_data['Sin_AWS2'] * 1.5  # Приблизительное соотношение
+            else:
+                aws_data['G_AWS2'] = 0.0
 
         return aws_data
 
@@ -889,30 +856,29 @@ def get_aws_data_at_time(aws_df, target_datetime):
 # ==================== ОСНОВНАЯ ФУНКЦИЯ С ИСПРАВЛЕННЫМ РАСЧЕТОМ ====================
 def run_glacier_model_final_correction(config=CONFIG):
     """
-    ФИНАЛЬНАЯ ИСПРАВЛЕННАЯ МОДЕЛЬ С ПРАВИЛЬНЫМ РАСЧЕТОМ SIN_CELL
+    ФИНАЛЬНАЯ ИСПРАВЛЕННАЯ ВЕРСИЯ
+    Исправлены отступы и шаг времени.
     """
     print("=" * 60)
-    print("ФИНАЛЬНАЯ МОДЕЛЬ С ПРАВИЛЬНЫМ ВРЕМЕННЫМ РЯДОМ SIN_CELL")
+    print("ЗАПУСК МОДЕЛИ: 100 ТОЧЕК, ШАГ 30 МИН")
     print("=" * 60)
 
     ensure_dir(config["output_dir"])
 
-    # Загружаем реальные метеоданные
+    # Загрузка данных
     aws_df = load_real_aws_data()
     if aws_df.empty:
-        print("✗ Не удалось загрузить метеоданные, создаем тестовые")
+        print("Creating test AWS data...")
         aws_df = create_test_aws_data()
 
-    check_coordinate_systems()
-
-    # Создаем точки исследования
+    # Точки
     points_gdf = create_research_points(config["dem_tif"], config["glacier_shp"])
     if points_gdf.empty:
-        raise Exception("Не удалось создать точки для расчета")
+        raise Exception("Не удалось создать точки!")
 
-    print(f"✓ Работаем с {len(points_gdf)} точками")
+    print(f"✓ Расчет будет выполнен для {len(points_gdf)} точек")
 
-    # Временные параметры
+    # Время
     start = pd.to_datetime(config["period_start"])
     end = pd.to_datetime(config["period_end"])
     time_step_seconds = config["time_step_minutes"] * 60
@@ -920,61 +886,37 @@ def run_glacier_model_final_correction(config=CONFIG):
     results = []
     current_time = start
 
-    print("\n=== ЗАПУСК ФИНАЛЬНЫХ РАСЧЕТОВ ===")
-    print("Используем точный временной ряд из Excel для Sin_cell\n")
-
-    # Создаем список времен для удобства отладки
-    all_times = []
-    while current_time <= end:
-        all_times.append(current_time)
-        current_time += dt.timedelta(minutes=config["time_step_minutes"])
-
-    # Сбрасываем время для расчетов
-    current_time = start
-
-    # Для отладки: создаем таблицу проверки для точки 94
+    # Отладка точки 94
     debug_data_94 = []
 
+    print("\n=== НАЧАЛО РАСЧЕТА ПО ВРЕМЕНИ ===")
+
+    # === ГЛАВНЫЙ ЦИКЛ ПО ВРЕМЕНИ ===
     while current_time <= end:
         time_str = current_time.strftime("%Y-%m-%d %H:%M")
-        time_decimal = current_time.hour + current_time.minute / 60.0
+        # Округляем до 2 знаков, чтобы избежать 4.000000001
+        time_decimal = round(current_time.hour + current_time.minute / 60.0, 2)
 
-        # Проверяем - ночь ли сейчас? (на основе данных Excel)
-        is_night = is_night_time_corrected(time_decimal)
-
-        # Получаем реальные метеоданные
+        # Получаем данные погоды один раз на этот момент времени
         aws_data = get_aws_data_at_time(aws_df, current_time)
-        if not aws_data:
-            current_time += dt.timedelta(minutes=config["time_step_minutes"])
-            continue
 
-        # -------------------------------------------------------------
-        # 1. РАСЧЕТ РАДИАЦИИ G (r.sun) ДЛЯ ВСЕХ ТОЧЕК
-        # Используем точный шаблон из Excel
-        # -------------------------------------------------------------
-        radiation_data = calculate_solar_radiation_with_excel_pattern(points_gdf, current_time)
+        # Получаем радиацию для ВСЕХ точек на этот момент
+        # (Функцию calculate_solar_radiation... используем старую или обновленную,
+        # главное что она возвращает словарь для всех точек)
+        radiation_data = calculate_solar_radiation_with_excel_pattern(points_gdf, current_time, aws_data)
+
+        for cat in radiation_data:
+            radiation_data[cat]['Sin_AWS2'] = aws_data['Sin_AWS2']
 
         if not radiation_data:
-            print(f"  {time_str} - Ошибка расчета радиации")
+            print(f"⚠ {time_str}: Нет данных радиации, пропускаем шаг")
             current_time += dt.timedelta(minutes=config["time_step_minutes"])
             continue
 
-        # Статус для отладки
-        if 94 in radiation_data:
-            rad_status = f"G_94={radiation_data[94]['G_cell']:.1f}, G_AWS2={radiation_data[94]['G_AWS2']:.1f}"
-        else:
-            rad_status = "нет данных точки 94"
+        print(f"  Обработка: {time_str} | Точек: {len(points_gdf)} | Погода T={aws_data.get('T2m_AWS2', '?'):.1f}")
 
-        if is_night:
-            radiation_status = f"НОЧЬ: {rad_status}"
-        else:
-            radiation_status = f"ДЕНЬ: {rad_status}"
-
-        print(f"  {time_str} - {radiation_status}")
-
-        # -------------------------------------------------------------
-        # 2. ЦИКЛ ПО ТОЧКАМ
-        # -------------------------------------------------------------
+        # === ВНУТРЕННИЙ ЦИКЛ ПО ТОЧКАМ ===
+        # Проходимся по КАЖДОЙ точке для ТЕКУЩЕГО времени
         for idx, point in points_gdf.iterrows():
             cat = point['cat']
             z = point['z']
@@ -982,246 +924,99 @@ def run_glacier_model_final_correction(config=CONFIG):
             if cat not in radiation_data:
                 continue
 
+            # --- РАСЧЕТЫ ---
             rad_info = radiation_data[cat]
             G_cell = rad_info['G_cell']
             G_AWS2_cell = rad_info['G_AWS2']
             Sin_AWS2_excel = rad_info['Sin_AWS2']
 
-            # ВАЖНО: Используем Sin_AWS2 из Excel, а не из измерений
-            # Это обеспечивает соответствие с ожидаемыми значениями
-            Sin_AWS2_real = Sin_AWS2_excel
+            # Sin Cell
+            Sin_cell = compute_Sin_cell_corrected(Sin_AWS2_excel, G_cell, G_AWS2_cell)
 
-            # =========================================================
-            # ГЛАВНОЕ ИСПРАВЛЕНИЕ: РАСЧЕТ SIN_CELL
-            # =========================================================
-            # Используем исправленную функцию с обработкой крайних случаев
-            Sin_cell = compute_Sin_cell_corrected(Sin_AWS2_real, G_cell, G_AWS2_cell)
-
-            # Для отладки точки 94
+            # Для отладки
             if cat == 94:
                 debug_data_94.append({
                     'datetime': current_time,
-                    'time_decimal': time_decimal,
-                    'G_cell': G_cell,
-                    'G_AWS2': G_AWS2_cell,
-                    'Sin_AWS2': Sin_AWS2_real,
-                    'Sin_cell_calculated': Sin_cell
+                    'Sin_cell': Sin_cell,
+                    'G_cell': G_cell
                 })
 
-            # Остальные расчеты
+            # Температура воздуха
             T2m_pt = compute_T2m_at_z(aws_data['T2m_AWS2'], config["kt"], z, config["z_aws2"])
 
+            # Альбедо и тип поверхности
             ST = 1 if z > config["bsl"] else 0
-            Ta = 50  # Примерное значение
-
-            alpha = compute_albedo(ST, T2m_pt, Ta, config["kSS"], config["kT2m"],
-                                   config["kTa"], config["c_alpha"])
+            Ta = 50
+            alpha = compute_albedo(ST, T2m_pt, Ta, config["kSS"], config["kT2m"], config["kTa"], config["c_alpha"])
             Sout = compute_Sout(alpha, Sin_cell)
 
             Lin = aws_data['Lin_AWS2']
 
-            # Первая итерация с временными значениями
+            # Итерация 1
             Lout_temp, Tsurface_temp = compute_Lout_corrected(config["epsilon"], config["sigma"], ST, 0)
-
-            Rnet_temp, Snet_temp, Lnet_temp = compute_Rnet(Sin_cell, Sout, Lin, Lout_temp)
-
             H, LE = compute_turbulent_heat_corrected(T2m_pt, Tsurface_temp, aws_data['wind_speed'],
                                                      aws_data['pressure'], aws_data['RH_AWS2'], z)
-
             Qr = compute_rain_heat_corrected(T2m_pt, Tsurface_temp, aws_data['precipitation'])
             Qg = compute_ground_heat_corrected(ST, Tsurface_temp, time_decimal)
-
-            # Первоначальный расчет Qm с временными значениями
             Qm_temp = compute_melting_heat(Sin_cell, Sout, Lin, Lout_temp, H, LE, Qr, Qg)
 
-            # Вторая итерация: пересчитываем Lout с учетом Qm
+            # Итерация 2 (уточнение Lout)
             Lout, Tsurface = compute_Lout_corrected(config["epsilon"], config["sigma"], ST, Qm_temp)
-
-            # Пересчитываем все с правильным Lout
             Rnet, Snet, Lnet = compute_Rnet(Sin_cell, Sout, Lin, Lout)
 
-            # Пересчитываем турбулентные потоки
+            # Финальные потоки
             H, LE = compute_turbulent_heat_corrected(T2m_pt, Tsurface, aws_data['wind_speed'],
                                                      aws_data['pressure'], aws_data['RH_AWS2'], z)
-
-            # Пересчитываем остальные потоки
             Qr = compute_rain_heat_corrected(T2m_pt, Tsurface, aws_data['precipitation'])
             Qg = compute_ground_heat_corrected(ST, Tsurface, time_decimal)
-
-            # Финальный расчет Qm
             Qm = compute_melting_heat(Sin_cell, Sout, Lin, Lout, H, LE, Qr, Qg)
 
             ablation = compute_ablation_corrected(Qm, ST, time_step_seconds,
                                                   config["rho_snow"], config["rho_ice"],
                                                   config["L_fs"], config["L_fi"])
 
+            # Сохраняем строку результата
             results.append({
                 'datetime': current_time,
-                'day_of_year': current_time.timetuple().tm_yday,
-                'time_decimal': time_decimal,
+                'time_str': time_str,
                 'cat': cat,
-                'x': point['x'],
-                'y': point['y'],
                 'z': z,
-
-                # РАДИАЦИЯ
                 'r_sun_global_rad': G_cell,
-                'G_cell': G_cell,
-                'G_AWS2_cell': G_AWS2_cell,
-                'Sin_AWS2_excel': Sin_AWS2_excel,
-                'Sin_AWS2_measured': aws_data['Sin_AWS2'],
                 'Sin_cell': Sin_cell,
-
-                # ПАРАМЕТРЫ ПОВЕРХНОСТИ
-                'alpha': alpha,
                 'Sout': Sout,
-                'Snet': Snet,
+                'Lin': Lin,
                 'Lout': Lout,
-                'Lnet': Lnet,
-                'Rnet': Rnet,
-                'T2m_pt': T2m_pt,
-                'T_surface': Tsurface,
-
-                # ТЕПЛОВЫЕ ПОТОКИ
+                'T2m': T2m_pt,
+                'Ts': Tsurface,
                 'H': H,
                 'LE': LE,
-                'turbulent_heat': H + LE,
                 'Qr': Qr,
                 'Qg': Qg,
                 'Qm': Qm,
-                'ablation_mm': ablation,
-
-                # ДОПОЛНИТЕЛЬНАЯ ИНФОРМАЦИЯ
-                'surface_type': 'snow' if ST == 1 else 'ice',
-                'is_night': is_night
+                'ablation_mm': ablation
             })
 
-            current_time += dt.timedelta(minutes=config["time_step_minutes"])
+        # === ВАЖНО: ПЕРЕКЛЮЧЕНИЕ ВРЕМЕНИ НАХОДИТСЯ ЗДЕСЬ ===
+        # Оно вне цикла `for point`, но внутри цикла `while current_time`
+        current_time += dt.timedelta(minutes=config["time_step_minutes"])
 
-            # Сохранение и анализ результатов
-            print("\n=== СОХРАНЕНИЕ РЕЗУЛЬТАТОВ ===")
-            results_df = pd.DataFrame(results)
+    # --- СОХРАНЕНИЕ ---
+    print("\n=== СОХРАНЕНИЕ ===")
+    results_df = pd.DataFrame(results)
 
-            # Основной файл результатов
-            output_csv = Path(config["output_dir"]) / "final_corrected_model_results.csv"
-            results_df.to_csv(output_csv, index=False, encoding='utf-8')
+    if results_df.empty:
+        print("⚠ ОШИБКА: Результаты пусты!")
+    else:
+        out_file = Path(config["output_dir"]) / "model_results_full.csv"
+        results_df.to_csv(out_file, index=False)
+        print(f"✓ Сохранено строк: {len(results_df)}")
+        print(f"✓ Файл: {out_file}")
 
-            # Файл для проверки точки 94
-            debug_df = pd.DataFrame(debug_data_94)
-            debug_csv = Path(config["output_dir"]) / "debug_point_94.csv"
-            debug_df.to_csv(debug_csv, index=False, encoding='utf-8')
+        # Проверка размера (должно быть: кол-во шагов * кол-во точек)
+        expected_rows = len(points_gdf) * len(pd.date_range(start, end, freq=f'{config["time_step_minutes"]}min'))
+        print(f"✓ Ожидалось строк примерно: {expected_rows}")
 
-            # Файл только с Sin_cell для точки 94
-            sin_94_df = results_df[results_df['cat'] == 94][['datetime', 'Sin_cell']].copy()
-            sin_94_df['datetime'] = sin_94_df['datetime'].dt.strftime('%d.%m.%Y %H:%M')
-            sin_94_csv = Path(config["output_dir"]) / "Sin_cell_point_94.csv"
-            sin_94_df.to_csv(sin_94_csv, index=False, encoding='utf-8')
-
-            # Проверка правильности расчета Sin для точки 94
-            print("\n=== ПРОВЕРКА РАСЧЕТА Sin ДЛЯ ТОЧКИ 94 ===")
-
-            # Ожидаемые значения из Excel
-            expected_sin_94 = {
-                "07.07.2019 0:00": 0.0,
-                "07.07.2019 0:30": 0.0,
-                "07.07.2019 1:00": 0.0,
-                "07.07.2019 1:30": 0.0,
-                "07.07.2019 2:00": 0.0,
-                "07.07.2019 2:30": 0.0,
-                "07.07.2019 3:00": 0.0,
-                "07.07.2019 3:30": 0.0,
-                "07.07.2019 4:00": 8.5,
-                "07.07.2019 4:30": 20.3,
-                "07.07.2019 5:00": 76.1,
-                "07.07.2019 5:30": 231.9,
-                "07.07.2019 6:00": 170.8,
-                "07.07.2019 6:30": 143.6,
-                "07.07.2019 7:00": 138.6,
-                "07.07.2019 7:30": 113.1,
-                "07.07.2019 8:00": 190.4,
-                "07.07.2019 8:30": 270.7,
-                "07.07.2019 9:00": 350.4,
-                "07.07.2019 9:30": 421.8,
-                "07.07.2019 10:00": 506.2,
-                "07.07.2019 10:30": 632.2,
-                "07.07.2019 11:00": 655.0,
-                "07.07.2019 11:30": 760.4,
-                "07.07.2019 12:00": 776.2,
-                "07.07.2019 12:30": 870.1,
-                "07.07.2019 13:00": 308.7,
-                "07.07.2019 13:30": 654.6,
-                "07.07.2019 14:00": 267.0,
-                "07.07.2019 14:30": 267.7,
-                "07.07.2019 15:00": 229.1,
-                "07.07.2019 15:30": 265.9,
-                "07.07.2019 16:00": 418.2,
-                "07.07.2019 16:30": 312.4,
-                "07.07.2019 17:00": 251.8,
-                "07.07.2019 17:30": 12.3,
-                "07.07.2019 18:00": 94.7,
-                "07.07.2019 18:30": 67.6,
-                "07.07.2019 19:00": 45.7,
-                "07.07.2019 19:30": 32.2,
-                "07.07.2019 20:00": 23.7,
-                "07.07.2019 20:30": 6.8,
-                "07.07.2019 21:00": 0.0,
-                "07.07.2019 21:30": 0.0,
-                "07.07.2019 22:00": 0.0,
-                "07.07.2019 22:30": 0.0,
-                "07.07.2019 23:00": 0.0,
-                "07.07.2019 23:30": 0.0
-            }
-
-            # Сравниваем расчетные значения с ожидаемыми
-            print("\nСравнение расчетных значений с ожидаемыми:")
-            print("=" * 60)
-            print(f"{'Время':<20} {'Ожидаемое':<10} {'Расчитанное':<10} {'Разница':<10}")
-            print("-" * 60)
-
-            total_diff = 0
-            count = 0
-
-            for time_str, expected in expected_sin_94.items():
-                # Преобразуем строку времени в datetime
-                dt_obj = pd.to_datetime(time_str, format='%d.%m.%Y %H:%M')
-                dt_str = dt_obj.strftime('%Y-%m-%d %H:%M:%S')
-
-                # Находим соответствующую запись
-                record = results_df[(results_df['cat'] == 94) &
-                                    (results_df['datetime'] == dt_obj)]
-
-                calculated = 0.0  # Инициализируем переменную ЗДЕСЬ, а не внутри if
-                diff = 0.0
-
-                if not record.empty:
-                    calculated = record.iloc[0]['Sin_cell']
-                    diff = abs(calculated - expected)
-                    total_diff += diff
-                    count += 1
-
-                    print(f"{time_str:<20} {expected:<10.1f} {calculated:<10.1f} {diff:<10.1f}")
-                else:
-                    # Если запись не найдена, показываем только ожидаемое значение
-                    print(f"{time_str:<20} {expected:<10.1f} {'-':<10} {'-':<10}")
-
-            if count > 0:
-                avg_diff = total_diff / count
-                print("-" * 60)
-                print(f"Средняя абсолютная разница: {avg_diff:.2f}")
-
-                if avg_diff < 10:
-                    print("✓ Расчет Sin_cell выполнен КОРРЕКТНО!")
-                else:
-                    print("⚠ Есть расхождения, но общая форма графика сохранена")
-            else:
-                print("-" * 60)
-                print("⚠ Не найдено записей для точки 94 для сравнения")
-
-            print(f"\nФайлы результатов сохранены в директории: {config['output_dir']}")
-            print(f"1. Основные результаты: {output_csv}")
-            print(f"2. Отладочные данные точки 94: {debug_csv}")
-            print(f"3. Sin_cell для точки 94: {sin_94_csv}")
-            print("\n🎉 МОДЕЛЬ УСПЕШНО ЗАВЕРШЕНА!")
+    print("ГОТОВО.")
 
 
 def create_test_aws_data():

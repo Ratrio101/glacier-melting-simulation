@@ -47,8 +47,8 @@ CONFIG = {
     "glacier_shp": "glacier.shp",
     "output_dir": "output_model",
     "time_step_minutes": 30,
-    "period_start": "2019-07-07T00:00:00",
-    "period_end": "2019-08-31T23:30:00",
+    "period_start": "2019-07-07T00:00:00", # по умолчанию - 2019-07-07T00:00:00
+    "period_end": "2019-08-31T23:30:00", # по умолчанию - 2019-08-31T23:30:00
     "kt": -0.0065,
     "asl": 1.7813, "bsl": 2067.6,
     "kSS": 0.33745, "kT2m": 0.00838, "kTa": -0.00112, "c_alpha": 0.13469,
@@ -310,16 +310,14 @@ def is_night_time_corrected(time_decimal):
     return time_decimal < sunrise or time_decimal > sunset
 
 
-def calculate_solar_radiation_with_excel_pattern(points_gdf, datetime_obj):
+def calculate_solar_radiation_with_excel_pattern(points_gdf, datetime_obj, aws_data):
     """
     Расчет солнечной радиации G(z,t) по точному шаблону из Excel
     Используем реальные значения из предоставленных данных
     """
     try:
-        time_decimal = datetime_obj.hour + datetime_obj.minute / 60.0
+        time_decimal = round(datetime_obj.hour + datetime_obj.minute / 60.0, 2)
 
-        # ТОЧНЫЕ значения G для точки 94 из Excel (для калибровки)
-        # Эти значения соответствуют r.sun (глобальной радиации)
         excel_g_values_94 = {
             0.0: 0.0, 0.5: 0.0, 1.0: 0.0, 1.5: 0.0, 2.0: 0.0, 2.5: 0.0, 3.0: 0.0,
             3.5: 12.9, 4.0: 22.8, 4.5: 32.7, 5.0: 42.4, 5.5: 51.6, 6.0: 60.1,
@@ -332,7 +330,7 @@ def calculate_solar_radiation_with_excel_pattern(points_gdf, datetime_obj):
             22.0: 0.0, 22.5: 0.0, 23.0: 0.0, 23.5: 0.0
         }
 
-        # Значения для AWS2 (точка 96) из Excel
+        # G для точки AWS2 (точка 96) — r.sun именно в точке метеостанции
         excel_g_values_96 = {
             0.0: 0.0, 0.5: 0.0, 1.0: 0.0, 1.5: 0.0, 2.0: 0.0, 2.5: 0.0, 3.0: 0.0,
             3.5: 13.5, 4.0: 23.9, 4.5: 34.3, 5.0: 44.5, 5.5: 54.2, 6.0: 63.1,
@@ -345,72 +343,59 @@ def calculate_solar_radiation_with_excel_pattern(points_gdf, datetime_obj):
             22.0: 0.0, 22.5: 0.0, 23.0: 0.0, 23.5: 0.0
         }
 
-        # Значения Sin для AWS2 из Excel (входящая коротковолновая радиация)
-        excel_sin_aws2 = {
-            0.0: 0.0, 0.5: 0.0, 1.0: 0.0, 1.5: 0.0, 2.0: 0.0, 2.5: 0.0, 3.0: 0.0,
-            3.5: 0.0, 4.0: 8.5, 4.5: 20.3, 5.0: 76.1, 5.5: 231.9, 6.0: 170.8,
-            6.5: 143.6, 7.0: 138.6, 7.5: 113.1, 8.0: 190.4, 8.5: 270.7, 9.0: 350.4,
-            9.5: 421.8, 10.0: 506.2, 10.5: 632.2, 11.0: 655.0, 11.5: 760.4,
-            12.0: 776.2, 12.5: 870.1, 13.0: 308.7, 13.5: 654.6, 14.0: 267.0,
-            14.5: 267.7, 15.0: 229.1, 15.5: 265.9, 16.0: 418.2, 16.5: 312.4,
-            17.0: 251.8, 17.5: 12.3, 18.0: 94.7, 18.5: 67.6, 19.0: 45.7,
-            19.5: 32.2, 20.0: 23.7, 20.5: 6.8, 21.0: 0.0, 21.5: 0.0,
-            22.0: 0.0, 22.5: 0.0, 23.0: 0.0, 23.5: 0.0
-        }
 
-        # Для остальных точек создаем реалистичные вариации
+
+        # Интерполяция G_cell (точка 94 — эталон)
+        hours_94 = sorted(excel_g_values_94.keys())
+        vals_94 = [excel_g_values_94[h] for h in hours_94]
+        g_cell_base = float(np.interp(time_decimal, hours_94, vals_94))
+
+        # Интерполяция G_AWS2 (точка 96 — метеостанция)
+        hours_96 = sorted(excel_g_values_96.keys())
+        vals_96 = [excel_g_values_96[h] for h in hours_96]
+        g_aws2 = float(np.interp(time_decimal, hours_96, vals_96))
+
+        # Реальное Sin_AWS2 из метеоданных (меняется каждый день!)
+        sin_aws2 = aws_data['Sin_AWS2']
+
+        # === ОТЛАДКА: ВСТАВИТЬ СЮДА ===
+        if not hasattr(calculate_solar_radiation_with_excel_pattern, '_debug_count'):
+            calculate_solar_radiation_with_excel_pattern._debug_count = 0
+
+        if calculate_solar_radiation_with_excel_pattern._debug_count < 48:
+            ratio = g_cell_base / g_aws2 if g_aws2 > 0.1 else 0
+            sin_cell_calc = sin_aws2 * ratio if g_aws2 > 0.1 else 0
+
+            print(f"  DEBUG {datetime_obj.strftime('%H:%M')}: "
+                  f"Sin_AWS2={sin_aws2:.1f}, "
+                  f"G_cell={g_cell_base:.1f}, G_AWS2={g_aws2:.1f}, "
+                  f"ratio={ratio:.4f}, "
+                  f"Sin_cell={sin_cell_calc:.1f}")
+
+            calculate_solar_radiation_with_excel_pattern._debug_count += 1
+        # === КОНЕЦ ОТЛАДКИ ===
+
         radiation_values = {}
 
         for idx, point in points_gdf.iterrows():
             cat = point['cat']
 
-            # Получаем базовые значения для времени
-            if time_decimal in excel_g_values_94:
-                base_g_94 = excel_g_values_94[time_decimal]
-                base_g_96 = excel_g_values_96[time_decimal]
-                sin_aws2 = excel_sin_aws2[time_decimal]
-            else:
-                # Интерполяция для промежуточных времен
-                hours = list(excel_g_values_94.keys())
-                g_94_values = list(excel_g_values_94.values())
-                g_96_values = list(excel_g_values_96.values())
-                sin_aws2_values = list(excel_sin_aws2.values())
-
-                base_g_94 = np.interp(time_decimal, hours, g_94_values)
-                base_g_96 = np.interp(time_decimal, hours, g_96_values)
-                sin_aws2 = np.interp(time_decimal, hours, sin_aws2_values)
-
-            if cat == 94:
-                # Точка 94 - используем точные значения из Excel для G
-                g_value = base_g_94
-                g_aws2_value = base_g_96
-                sin_aws2_value = sin_aws2
-            elif cat == 96:
-                # Точка AWS2 (96) - используем значения для AWS2
-                g_value = base_g_96
-                g_aws2_value = base_g_96
-                sin_aws2_value = sin_aws2
-            else:
-                # Для других точек создаем вариации на основе точки 94
-                # Вариации зависят от высоты и положения точки
-                height_factor = 1.0 + (point['z'] - 2560) / 1000 * 0.1
-                position_factor = 0.9 + 0.2 * (cat % 10) / 10
-                variation = height_factor * position_factor
-
-                g_value = base_g_94 * variation
-                g_aws2_value = base_g_96
-                sin_aws2_value = sin_aws2
+            # Небольшая поправка G_cell по высоте точки
+            height_factor = 1.0 + (point['z'] - 2560) / 1000 * 0.05
+            g_cell = g_cell_base * height_factor
 
             radiation_values[cat] = {
-                'G_cell': g_value,
-                'G_AWS2': g_aws2_value,
-                'Sin_AWS2': sin_aws2_value
+                'G_cell': g_cell,
+                'G_AWS2': g_aws2,  # ← ФИКС: реальное значение r.sun для AWS2
+                'Sin_AWS2': sin_aws2  # ← ФИКС: реальное значение из метеоданных
             }
+
+
 
         return radiation_values
 
     except Exception as e:
-        print(f"✗ Ошибка расчета радиации по шаблону Excel: {e}")
+        print(f"✗ Ошибка расчета радиации: {e}")
         return {}
 
 
@@ -435,30 +420,13 @@ def compute_Sin_cell_corrected(Sin_AWS2, G_cell, G_AWS2):
     2. Если G_cell близко к 0 (точка в тени)
     3. Ночные условия
     """
-    # Если ночь или оба значения G близки к 0
-    if Sin_AWS2 < 1.0:
+    if G_AWS2 <= 0.1 or Sin_AWS2 <= 0:
         return 0.0
 
-    # Если G_AWS2 очень маленькое (близко к 0), но есть Sin_AWS2
-    if G_AWS2 < 0.1:
-        # Это случай сумерек/рассеянного света
-        # Используем пропорцию на основе высоты солнца
-        if G_cell > 0.1:
-            # Точка получает прямой свет, а AWS2 - только рассеянный
-            # Используем эмпирическую формулу
-            return Sin_AWS2 * 0.3  # 30% от измеренного на AWS2
-        else:
-            # Обе точки в тени/ночи
-            return 0.0
-
-    # Нормальный расчет по формуле
+        # САМАЯ ПРОСТАЯ ФОРМУЛА
     sin_cell = Sin_AWS2 * (G_cell / G_AWS2)
 
-    # Ограничиваем максимальное значение (не может быть больше Sin_AWS2 более чем в 1.5 раза)
-    max_sin = Sin_AWS2 * 1.5
-    if sin_cell > max_sin:
-        sin_cell = max_sin
-
+    # Не делаем никаких дополнительных проверок!
     return max(0.0, sin_cell)
 
 
@@ -802,14 +770,11 @@ def load_real_aws_data(excel_file="test_model.xlsx", sheet_name="AWS2_30min"):
     try:
         print(f"Загружаем реальные метеоданные из {excel_file}...")
 
-        # Читаем Excel, пропускаем первые 2 строки (заголовки)
         df = pd.read_excel(excel_file, sheet_name=sheet_name, header=2)
 
-        # Переименовываем столбцы для удобства
+        print(f"Столбцы ДО переименования: {df.columns.tolist()}")
+
         column_mapping = {
-            'X': 'x_aws2',
-            'Y': 'y_aws2',
-            'Z': 'z_aws2',
             'Sin': 'Sin_AWS2',
             'Sout': 'Sout_AWS2',
             'Lin': 'Lin_AWS2',
@@ -823,39 +788,115 @@ def load_real_aws_data(excel_file="test_model.xlsx", sheet_name="AWS2_30min"):
 
         df = df.rename(columns=column_mapping)
 
-        # Добавляем столбец datetime (предполагаем, что данные идут с шагом 30 мин с начала периода)
-        start_date = pd.to_datetime(CONFIG["period_start"])
-        df['datetime'] = [start_date + pd.Timedelta(minutes=30 * i) for i in range(len(df))]
+        # === ОТЛАДКА: показываем данные для 7 июля ===
+        if 'Дата&Время' in df.columns:
+            df['datetime'] = pd.to_datetime(df['Дата&Время'])
 
-        print(f"✓ Загружено {len(df)} записей метеоданных")
-        print("Доступные столбцы:", df.columns.tolist())
+        # Фильтруем 7 июля
+        july7 = df[df['datetime'].dt.date == pd.to_datetime('2019-07-07').date()]
 
+        print(f"\n=== ДАННЫЕ ЗА 7 ИЮЛЯ ===")
+        print(f"Найдено записей: {len(july7)}")
+
+        if len(july7) > 0:
+            print(f"\nПервые 10 записей 7 июля:")
+            for i, (idx, row) in enumerate(july7.head(10).iterrows()):
+                time_str = row['datetime'].strftime('%H:%M')
+                sin_val = row['Sin_AWS2']
+                print(f"  {time_str}: Sin_AWS2 = {sin_val}")
+
+            # Проверяем полдень
+            noon = july7[july7['datetime'].dt.hour == 12]
+            print(f"\nДанные в 12:00-12:30:")
+            for idx, row in noon.iterrows():
+                time_str = row['datetime'].strftime('%H:%M')
+                sin_val = row['Sin_AWS2']
+                print(f"  {time_str}: Sin_AWS2 = {sin_val}")
+
+        print(f"=== КОНЕЦ ОТЛАДКИ ===\n")
+        # === КОНЕЦ ОТЛАДКИ ===
+
+        df = df.dropna(subset=['datetime'])
+        df = df.sort_values('datetime').reset_index(drop=True)
+
+        print(f"✓ Загружено {len(df)} записей")
         return df
 
     except Exception as e:
-        print(f"✗ Ошибка загрузки метеоданных: {e}")
+        print(f"✗ Ошибка: {e}")
+        import traceback
+        traceback.print_exc()
         return pd.DataFrame()
 
 
 def get_aws_data_at_time(aws_df, target_datetime):
     """
-    Возвращает метеоданные для конкретного времени с проверкой типов данных
+    Возвращает метеоданные для конкретного времени
+    ИСПРАВЛЕНО: если нет точного совпадения — интерполируем
     """
     try:
-        # Находим точное совпадение по времени
+        # Ищем точное совпадение
         mask = aws_df['datetime'] == target_datetime
         if mask.any():
             row = aws_df[mask].iloc[0]
         else:
-            # Или ближайшую запись
-            time_diff = abs(aws_df['datetime'] - target_datetime)
-            closest_idx = time_diff.idxmin()
-            row = aws_df.loc[closest_idx]
+            # Ищем ближайшие записи ДО и ПОСЛЕ
+            before = aws_df[aws_df['datetime'] <= target_datetime]
+            after = aws_df[aws_df['datetime'] >= target_datetime]
 
-        # Функция для безопасного преобразования в float
+            if len(before) > 0 and len(after) > 0:
+                row_before = before.iloc[-1]
+                row_after = after.iloc[0]
+
+                # Линейная интерполяция
+                t_before = row_before['datetime']
+                t_after = row_after['datetime']
+                t_target = target_datetime
+
+                if t_after != t_before:
+                    weight = (t_target - t_before).total_seconds() / (t_after - t_before).total_seconds()
+                else:
+                    weight = 0.5
+
+                # Интерполируем числовые поля
+                def interp(col):
+                    v1 = safe_float(row_before[col])
+                    v2 = safe_float(row_after[col])
+                    return v1 + (v2 - v1) * weight
+
+                aws_data = {
+                    'Sin_AWS2': interp('Sin_AWS2'),
+                    'Sout_AWS2': interp('Sout_AWS2'),
+                    'Lin_AWS2': interp('Lin_AWS2'),
+                    'T2m_AWS2': interp('T2m_AWS2'),
+                    'RH_AWS2': interp('RH_AWS2'),
+                    'wind_speed': interp('wind_speed'),
+                    'pressure': interp('pressure'),
+                    'precipitation': interp('precipitation'),
+                    'alpha_AWS2': interp('alpha_AWS2'),
+                }
+
+                if aws_data['alpha_AWS2'] > 0:
+                    aws_data['G_AWS2'] = aws_data['Sin_AWS2'] / aws_data['alpha_AWS2']
+                else:
+                    aws_data['G_AWS2'] = 0
+
+                return aws_data
+
+            elif len(before) > 0:
+                # Берём последнее значение перед target
+                row = before.iloc[-1]
+            elif len(after) > 0:
+                # Берём первое значение после target
+                row = after.iloc[0]
+            else:
+                # Вообще нет данных
+                return get_default_aws_data()
+
+        # Функция для безопасного преобразования
         def safe_float(value, default=0.0):
             try:
-                if pd.isna(value) or value == '' or value is None:
+                if pd.isna(value) or value == '' or value is None or value == 'NODATA':
                     return default
                 return float(value)
             except (ValueError, TypeError):
@@ -870,34 +911,35 @@ def get_aws_data_at_time(aws_df, target_datetime):
             'wind_speed': safe_float(row['wind_speed']),
             'pressure': safe_float(row['pressure']),
             'precipitation': safe_float(row['precipitation']),
-            'alpha_AWS2': safe_float(row['alpha_AWS2']),
+            'alpha_AWS2': safe_float(row['alpha_AWS2'], 0.5),
         }
 
-        # Значения из Excel для калибровки
-        # В Excel обычно G рассчитывается как Sin/alpha
-        if aws_data['alpha_AWS2'] > 0:
+        if aws_data['alpha_AWS2'] > 0 and aws_data['alpha_AWS2'] <= 1.0:
             aws_data['G_AWS2'] = aws_data['Sin_AWS2'] / aws_data['alpha_AWS2']
         else:
-            aws_data['G_AWS2'] = 887.7  # Значение по умолчанию из примера
+            aws_data['G_AWS2'] = 0
 
         return aws_data
 
     except Exception as e:
-        print(f"Ошибка получения метеоданных для времени {target_datetime}: {e}")
-        # Возвращаем данные по умолчанию в случае ошибки
-        return {
-            'Sin_AWS2': 0.0,
-            'Sout_AWS2': 0.0,
-            'Lin_AWS2': 300.0,
-            'T2m_AWS2': 5.0,
-            'RH_AWS2': 70.0,
-            'wind_speed': 2.0,
-            'pressure': 1013.0,
-            'precipitation': 0.0,
-            'alpha_AWS2': 0.5,
-            'G_AWS2': 887.7
-        }
+        print(f"Ошибка получения метеоданных для {target_datetime}: {e}")
+        return get_default_aws_data()
 
+
+def get_default_aws_data():
+    """Возвращает дефолтные метеоданные"""
+    return {
+        'Sin_AWS2': 0.0,
+        'Sout_AWS2': 0.0,
+        'Lin_AWS2': 300.0,
+        'T2m_AWS2': 5.0,
+        'RH_AWS2': 70.0,
+        'wind_speed': 2.0,
+        'pressure': 1013.0,
+        'precipitation': 0.0,
+        'alpha_AWS2': 0.5,
+        'G_AWS2': 0.0
+    }
 
 # ==================== ОСНОВНАЯ ФУНКЦИЯ С ИСПРАВЛЕННЫМ РАСЧЕТОМ ====================
 def run_glacier_model_final_correction(config=CONFIG):
@@ -949,7 +991,10 @@ def run_glacier_model_final_correction(config=CONFIG):
         # Получаем радиацию для ВСЕХ точек на этот момент
         # (Функцию calculate_solar_radiation... используем старую или обновленную,
         # главное что она возвращает словарь для всех точек)
-        radiation_data = calculate_solar_radiation_with_excel_pattern(points_gdf, current_time)
+        radiation_data = calculate_solar_radiation_with_excel_pattern(points_gdf, current_time, aws_data)
+
+        for cat in radiation_data:
+            radiation_data[cat]['Sin_AWS2'] = aws_data['Sin_AWS2']
 
         if not radiation_data:
             print(f"⚠ {time_str}: Нет данных радиации, пропускаем шаг")
