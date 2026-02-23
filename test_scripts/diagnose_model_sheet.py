@@ -1,5 +1,14 @@
 import pandas as pd
 
+df = pd.read_excel("../test_model.xlsx", sheet_name="Model_30min", header=2)
+
+# Показываем G для разных точек в одно время
+print("G (РСАН) для разных точек в 12:00:")
+for cat in [1, 2, 10, 50, 94, 96, 100]:
+    rows = df[df['No'] == cat]
+    if len(rows) > 0:
+        row = rows.iloc[0]
+        print(f"  Точка {cat}: G={row['G']:.1f}, G(AWS2)={row['G(AWS2)']:.1f}")
 
 def diagnose_model_sheet(excel_file="../test_model.xlsx"):
     """
