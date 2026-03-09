@@ -1,1192 +1,1089 @@
 #!/usr/bin/env python3
-"""
-ПОЛНАЯ МОДЕЛЬ ЛЕДНИКА С РЕАЛЬНЫМ РАСЧЕТОМ r.sun ЧЕРЕЗ GRASS
-"""
+
 import os
 import sys
 import math
 import tempfile
 import datetime as dt
 from pathlib import Path
+import shutil
 import subprocess
 import numpy as np
 import pandas as pd
 import geopandas as gpd
 import rasterio
-from rasterio.transform import rowcol
-from rasterio.windows import Window
+from rasterio.crs import CRS
 
-# Просто проверяем наличие GRASS
-grass_base = r"C:\Program Files\GRASS GIS 7.8"
-grass_bat = os.path.join(grass_base, "grass78.bat")
 
-if not os.path.exists(grass_bat):
-    print(f"✗ GRASS не найден по пути: {grass_bat}")
-    print("  Установите GRASS GIS 7.8 или измените путь")
-    sys.exit(1)
+os.environ["GRASSBIN"] = r"C:\Users\skibc\GRASSG~1.8\grass78.bat"
+GRASS_DB = r"C:\Users\skibc\OneDrive\Документы\grassdata"
+LOCATION = "glacier"
+MAPSET = "PERMANENT"
 
-print(f"✓ GRASS найден: {grass_bat}")
+from grass_session import Session
+import grass.script as gs
 
-# ========== КОНФИГУРАЦИЯ ==========
+def start_grass():
+
+    sess = Session()
+    sess.open(
+        gisdb=GRASS_DB,
+        location=LOCATION,
+        mapset=MAPSET
+    )
+
+    print("✓ GRASS session started")
+
+    return sess
+
+def run_rsun(session, day_of_year, time_decimal):
+    import grass.script as gs
+
+    rad_map = 'rad_map'  # имя выходной карты
+    gs.run_command(
+        'r.sun',
+        elevation='DEM',
+        slope='slope',
+        aspect='aspect',
+        day=day_of_year,
+        time=time_decimal,
+        output=rad_map,
+        overwrite=True
+    )
+    return rad_map
+
+def get_rsun_points(rad_map):
+
+    gs.run_command(
+        "v.what.rast",
+        map="points",
+        raster=rad_map,
+        column="G"
+    )
+
+    table = gs.read_command(
+        "v.db.select",
+        map="points",
+        columns="cat,G"
+    )
+
+    G = {}
+
+    for line in table.strip().split("\n")[1:]:
+        cat, val = line.split("|")
+        G[int(cat)] = float(val)
+
+    return G
+
+# ---------------------------
+# ========== CONFIG =========
+# ---------------------------
 CONFIG = {
     "dem_tif": "DEM.tif",
+    "elevation_tif": "elevation.tif",
+    "slope_tif": "slope.tif",
+    "aspect_tif": "aspect.tif",
     "glacier_shp": "glacier.shp",
     "output_dir": "output_model",
     "time_step_minutes": 30,
-    "period_start": "2019-07-07T00:00:00",
-    "period_end": "2019-07-07T23:30:00",
-    "kt": -0.0065,  # вертикальный градиент температуры
-    "asl": 1.7813, "bsl": 2067.6,  # коэффициенты для снеговой линии
-    "kSS": 0.33745, "kT2m": 0.00838, "kTa": -0.00112, "c_alpha": 0.13469,  # альбедо
-    "rho_ice": 900, "rho_snow": 400,  # плотность льда и снега (кг/м³)
-    "sigma": 5.670374419e-8,  # постоянная Стефана-Больцмана
-    "epsilon": 1,  # излучательная способность
-    "z_aws1": 2540,  # высота AWS1 (морена)
-    "z_aws2": 2561,  # высота AWS2 (ледник)
-    "L_fs": 334000,  # теплота плавления снега (Дж/кг)
-    "L_fi": 334000,  # теплота плавления льда (Дж/кг)
-    "alpha_d": 0.06,  # критическая разность альбедо для определения снегопада
-    "z0m": 0.001,  # длина шероховатости для момента (м)
-    "z0t": 0.0001,  # длина шероховатости для температуры (м)
-    "z0h": 0.0001,  # длина шероховатости для влажности (м)
-    "zm": 2.0,  # высота измерений (м)
+    "period_start": "2019-07-07T00:00:00", # по умолчанию - 2019-07-07T00:00:00
+    "period_end": "2019-08-31T23:30:00", # по умолчанию - 2019-08-31T23:30:00
+    "kt": -0.0065,
+    "asl": 1.7813, "bsl": 2067.6,
+    "kSS": 0.33745, "kT2m": 0.00838, "kTa": -0.00112, "c_alpha": 0.13469,
+    "rho_ice": 784, "rho_snow": 602,
+    "sigma": 5.670374419e-8,
+    "epsilon": 1,
+    "z_aws1": 2540,
+    "z_aws2": 2561,
+    "L_fs": 330000,
+    "L_fi": 335000,
+    "latitude": 42.9,  # Широта для расчетов солнечной радиации
 }
 
+
 def ensure_dir(d):
-    """Создает директорию, если её нет"""
     os.makedirs(d, exist_ok=True)
 
 
+# ==================== ФУНКЦИИ ДЛЯ ФАЙЛОВ ====================
+def check_shapefile_completeness(shp_path):
+    """Проверяет наличие всех необходимых файлов shapefile"""
+    shp_path = Path(shp_path)
+    required_extensions = ['.shp', '.shx', '.dbf', '.prj']
+    missing_files = []
+    for ext in required_extensions:
+        if not shp_path.with_suffix(ext).exists():
+            missing_files.append(shp_path.with_suffix(ext).name)
+    if missing_files:
+        print(f"⚠ Отсутствуют файлы shapefile: {missing_files}")
+        return False
+    else:
+        print("✓ Все файлы shapefile присутствуют")
+        return True
+
+
+def repair_shapefile(shp_path):
+    """Восстанавливает недостающие файлы shapefile"""
+    shp_path = Path(shp_path)
+    if not shp_path.with_suffix('.prj').exists():
+        print("Создаем .prj файл из DEM...")
+        try:
+            with rasterio.open("DEM.tif") as dem:
+                crs = dem.crs
+                if crs:
+                    crs_wkt = crs.to_wkt()
+                    with open(shp_path.with_suffix('.prj'), 'w', encoding='utf-8') as f:
+                        f.write(crs_wkt)
+                    print("✓ .prj файл создан")
+        except Exception as e:
+            print(f"✗ Ошибка создания .prj: {e}")
+    if not shp_path.with_suffix('.shx').exists():
+        print("Восстанавливаем .shx файл...")
+        try:
+            gdf = gpd.read_file(shp_path)
+            gdf.to_file(shp_path, driver='ESRI Shapefile')
+            print("✓ .shx файл восстановлен")
+        except Exception as e:
+            print(f"✗ Ошибка восстановления .shx: {e}")
+
+
 def get_raster_info(raster_path):
-    """Получает информацию о растре"""
-    with rasterio.open(raster_path) as src:
-        return {
-            'crs': src.crs,
-            'bounds': src.bounds,
-            'width': src.width,
-            'height': src.height,
-            'res': src.res,
-            'transform': src.transform,
-            'nodata': src.nodata
+    """Получает информацию о raster файле"""
+    try:
+        with rasterio.open(raster_path) as src:
+            info = {
+                'crs': src.crs,
+                'bounds': src.bounds,
+                'width': src.width,
+                'height': src.height,
+                'res': src.res,
+                'dtype': src.dtypes[0],
+                'nodata': src.nodata
+            }
+            print(f"DEM CRS: {src.crs}")
+            print(f"DEM Bounds: {src.bounds}")
+            print(f"DEM Size: {src.width} x {src.height}")
+            return info
+    except Exception as e:
+        print(f"✗ Ошибка чтения DEM: {e}")
+        return None
+
+
+# ==================== GRASS ФУНКЦИИ ====================
+def setup_grass_simple():
+    """
+    Настройка GRASS с дополнительными растровыми данными
+    """
+    print("=== НАСТРОЙКА GRASS С ДОПОЛНИТЕЛЬНЫМИ РАСТРАМИ ===")
+
+    gisdb = tempfile.mkdtemp(prefix="grass_simple_")
+    location_name = "glacier_location"
+
+    print(f"GRASS database: {gisdb}")
+
+    try:
+        grass_bat = r"C:\Users\skibc\GRASS_GIS_7.8\grass78.bat"
+
+        # Создаем location
+        cmd = [grass_bat, "-c", "EPSG:4326", "-e", os.path.join(gisdb, location_name)]
+        print("Создаем location...")
+        subprocess.run(cmd, capture_output=True, timeout=60, shell=True)
+
+        # Импортируем основные растры если они существуют
+        raster_files = {
+            "dem": CONFIG["dem_tif"],
+            "elevation": CONFIG.get("elevation_tif"),
+            "slope": CONFIG.get("slope_tif"),
+            "aspect": CONFIG.get("aspect_tif")
         }
 
-
-def extract_point_values_from_raster(raster_path, points_gdf):
-    """
-    Извлекает значения растра в точках
-    """
-    values = {}
-    with rasterio.open(raster_path) as src:
-        for idx, point in points_gdf.iterrows():
-            # Конвертируем координаты в индексы растра
-            row, col = src.index(point.geometry.x, point.geometry.y)
-            window = Window(col, row, 1, 1)
-            value = src.read(1, window=window)[0, 0]
-            if value != src.nodata and not np.isnan(value):
-                values[point['cat']] = float(value)
+        for raster_name, file_path in raster_files.items():
+            if file_path and os.path.exists(file_path):
+                print(f"Импортируем {raster_name}...")
+                import_cmd = [grass_bat, "--config", "path", gisdb, location_name, "PERMANENT",
+                              "--exec", "r.in.gdal", f"input={file_path}", f"output={raster_name}", "--overwrite"]
+                subprocess.run(import_cmd, capture_output=True, timeout=60, shell=True)
             else:
-                values[point['cat']] = 0.0
-    return values
+                print(f"Файл {file_path} не найден, пропускаем {raster_name}")
 
+        # Если slope/aspect отсутствуют, вычисляем их из DEM
+        if not os.path.exists(CONFIG.get("slope_tif")) and os.path.exists(CONFIG["dem_tif"]):
+            print("Вычисляем slope и aspect из DEM...")
+            slope_cmd = [grass_bat, "--config", "path", gisdb, location_name, "PERMANENT",
+                         "--exec", "r.slope.aspect", "elevation=dem", "slope=slope", "aspect=aspect", "--overwrite"]
+            subprocess.run(slope_cmd, capture_output=True, timeout=60, shell=True)
 
-def setup_grass_environment():
-    """
-    Настраивает временную GRASS сессию и импортирует данные
-    """
-    print("=== НАСТРОЙКА GRASS СРЕДЫ ===")
+        # Импортируем векторные данные
+        print("Импортируем glacier...")
+        glacier_cmd = [grass_bat, "--config", "path", gisdb, location_name, "PERMANENT",
+                       "--exec", "v.in.ogr", "input=glacier.shp", "output=glacier", "--overwrite"]
+        subprocess.run(glacier_cmd, capture_output=True, timeout=60, shell=True)
 
-    # Создаем временную директорию для GRASS
-    gisdb = tempfile.mkdtemp(prefix="grass_")
-    location = "glacier_location"
-    mapset = "PERMANENT"
+        # Устанавливаем регион и маску
+        print("Устанавливаем регион...")
+        region_cmd = [grass_bat, "--config", "path", gisdb, location_name, "PERMANENT",
+                      "--exec", "g.region", "raster=dem"]
+        subprocess.run(region_cmd, capture_output=True, timeout=30, shell=True)
 
-    grass_bat = r"C:\Program Files\GRASS GIS 7.8\grass78.bat"  # Тот же путь
+        print("Создаем маску...")
+        mask_cmd = [grass_bat, "--config", "path", gisdb, location_name, "PERMANENT",
+                    "--exec", "r.mask", "vector=glacier", "--overwrite"]
+        subprocess.run(mask_cmd, capture_output=True, timeout=30, shell=True)
 
-    # Проверяем существование
-    if not os.path.exists(grass_bat):
-        print(f"✗ GRASS не найден: {grass_bat}")
-        return None, None, None, None
+        print("✓ GRASS настройка с дополнительными растрами завершена")
+        return gisdb, location_name
 
-    print(f"  Используем GRASS: {grass_bat}")
-    print(f"  GISDBASE: {gisdb}")
-
-    # Функция для выполнения команд GRASS
-    def run_grass_cmd(cmd_list, description=""):
-        # Собираем команду
-        full_cmd = [grass_bat, "--config", "path", gisdb, location, mapset, "--exec"] + cmd_list
-
-        if description:
-            print(f"  {description}...")
-
-        try:
-            # Запускаем с таймаутом
-            result = subprocess.run(
-                full_cmd,
-                capture_output=True,
-                text=True,
-                timeout=120,
-                encoding='utf-8',
-                errors='ignore'
-            )
-
-            if result.returncode != 0:
-                if result.stderr and len(result.stderr) > 0:
-                    print(f"  ⚠ Ошибка: {result.stderr[:200]}")
-                return False
-
-            return True
-
-        except subprocess.TimeoutExpired:
-            print(f"  ⚠ Таймаут команды")
-            return False
-        except Exception as e:
-            print(f"  ⚠ Ошибка выполнения: {e}")
-            return False
-
-    # Создаем location
-    print("  Создание location...")
-    create_cmd = [grass_bat, "-c", CONFIG["dem_tif"], "-e", os.path.join(gisdb, location)]
-    try:
-        result = subprocess.run(create_cmd, capture_output=True, text=True, timeout=60)
-        if result.returncode != 0:
-            print(f"  ⚠ Ошибка создания location: {result.stderr}")
-            return None, None, None, None
     except Exception as e:
-        print(f"  ⚠ Ошибка: {e}")
-        return None, None, None, None
-
-    # Импортируем DEM
-    if not run_grass_cmd(["r.in.gdal", f"input={CONFIG['dem_tif']}", "output=dem", "--overwrite"],
-                         "Импорт DEM"):
-        return None, None, None, None
-
-    # Вычисляем slope и aspect
-    if not run_grass_cmd(["r.slope.aspect", "elevation=dem", "slope=slope", "aspect=aspect", "--overwrite"],
-                         "Вычисление slope/aspect"):
-        # Продолжаем, может они уже есть
-        print("  ⚠ Не удалось вычислить slope/aspect")
-
-    # Импортируем границы ледника
-    if not run_grass_cmd(["v.in.ogr", f"input={CONFIG['glacier_shp']}", "output=glacier", "--overwrite"],
-                         "Импорт границ ледника"):
-        print("  ⚠ Не удалось импортировать границы ледника")
-
-    # Устанавливаем регион
-    if not run_grass_cmd(["g.region", "raster=dem"], "Установка региона"):
-        print("  ⚠ Не удалось установить регион")
-
-    print("✓ GRASS среда настроена")
-    return gisdb, location, mapset, grass_bat
+        print(f"✗ Ошибка настройки GRASS: {e}")
+        return None, None
 
 
-def calculate_rsun_for_time(gisdb, location, mapset, grass_bat,
-                            points_gdf, target_datetime):
+def run_r_sun_grass(gisdb, location_name, day_of_year, time_decimal, points_count):
     """
-    Запускает r.sun для конкретного времени и возвращает значения G(z,t) для всех точек
+    Запускает r.sun через GRASS и возвращает значения радиации
     """
-    # Вычисляем день года и время
-    day_of_year = target_datetime.timetuple().tm_yday
-    time_decimal = target_datetime.hour + target_datetime.minute / 60.0
+    grass_bat = r"C:\Users\skibc\GRASS GIS 7.8\grass78.bat"
 
-    print(f"\n  r.sun расчет: день {day_of_year}, время {time_decimal:.2f}")
+    rad_name = f"radiation_{day_of_year}_{int(time_decimal * 100)}"
 
-    # Уникальное имя для выходного растра
-    rad_name = f"glob_rad_{day_of_year}_{int(time_decimal * 100):03d}"
-
-    # Функция для выполнения команд GRASS
-    def run_grass_cmd(cmd_list, timeout=180):
-        full_cmd = [
-                       grass_bat,
-                       "--config", "path", gisdb, location, mapset,
-                       "--exec"
-                   ] + cmd_list
-        try:
-            result = subprocess.run(
-                full_cmd,
-                capture_output=True,
-                text=True,
-                timeout=timeout,
-                encoding='utf-8',
-                errors='ignore'
-            )
-            if result.returncode != 0:
-                print(f"    ⚠ STDERR: {result.stderr[:200] if result.stderr else 'None'}")
-            return result.returncode == 0, result.stdout, result.stderr
-        except subprocess.TimeoutExpired:
-            print(f"    ⚠ Таймаут команды")
-            return False, "", "Timeout"
-        except Exception as e:
-            print(f"    ⚠ Ошибка: {e}")
-            return False, "", str(e)
-
-    # Проверяем, есть ли уже slope и aspect
-    print("  Проверка наличия slope и aspect...")
-    check_cmd = ["g.list", "type=raster", "pattern=slope*"]
-    success, stdout, stderr = run_grass_cmd(check_cmd)
-    if not success or "slope" not in stdout:
-        print("  Вычисляем slope и aspect...")
-        slope_cmd = ["r.slope.aspect", "elevation=dem", "slope=slope", "aspect=aspect", "--overwrite"]
-        run_grass_cmd(slope_cmd)
-
-    # Запускаем r.sun
-    print(f"  Запуск r.sun для {len(points_gdf)} точек...")
-    rsun_cmd = [
-        "r.sun",
+    # 1. считаем r.sun
+    subprocess.run([
+        grass_bat, "--exec", "r.sun",
         "elevation=dem",
         "slope=slope",
         "aspect=aspect",
         f"day={day_of_year}",
-        f"time={time_decimal:.2f}",
+        f"time={time_decimal}",
         f"glob_rad={rad_name}",
         "--overwrite"
-    ]
+    ])
 
-    success, stdout, stderr = run_grass_cmd(rsun_cmd, timeout=300)
+    # 2. читаем значения в точках
+    subprocess.run([
+        grass_bat, "--exec", "v.what.rast",
+        "map=points",
+        f"raster={rad_name}",
+        "column=G"
+    ])
 
-    if not success:
-        print(f"  ✗ r.sun не удался")
-        return {}
-
-    print(f"  ✓ r.sun выполнен успешно")
-
-    # Пробуем несколько способов получить значения
+    # 3. экспорт таблицы
+    result = subprocess.run([
+        grass_bat, "--exec", "v.db.select",
+        "map=points",
+        "columns=cat,G"
+    ], capture_output=True, text=True)
 
     G_values = {}
 
-    # СПОСОБ 1: Прямой экспорт растра и чтение через rasterio
-    print("  Способ 1: Прямой экспорт растра...")
-    temp_tif = tempfile.NamedTemporaryFile(suffix='.tif', delete=False)
-    temp_tif.close()
-
-    export_cmd = ["r.out.gdal", f"input={rad_name}", f"output={temp_tif.name}", "format=GTiff", "--overwrite", "-c"]
-    success, stdout, stderr = run_grass_cmd(export_cmd)
-
-    if success and os.path.exists(temp_tif.name) and os.path.getsize(temp_tif.name) > 0:
-        try:
-            with rasterio.open(temp_tif.name) as src:
-                for idx, point in points_gdf.iterrows():
-                    try:
-                        # Конвертируем координаты в индексы растра
-                        row, col = src.index(point.geometry.x, point.geometry.y)
-
-                        # Проверяем, что индексы в пределах растра
-                        if 0 <= row < src.height and 0 <= col < src.width:
-                            window = Window(col, row, 1, 1)
-                            val = src.read(1, window=window)[0, 0]
-                            if val != src.nodata and not np.isnan(val) and val > 0:
-                                G_values[point['cat']] = float(val)
-                    except Exception as e:
-                        continue
-
-            if G_values:
-                print(f"    Получено {len(G_values)} значений через экспорт")
-        except Exception as e:
-            print(f"    Ошибка чтения экспортированного растра: {e}")
-
-    # Очистка временного файла
-    if os.path.exists(temp_tif.name):
-        os.unlink(temp_tif.name)
-
-    # СПОСОБ 2: Если не получили значения, пробуем r.stats
-    if not G_values:
-        print("  Способ 2: Использование r.stats...")
-        stats_cmd = ["r.stats", f"map={rad_name}", "flags=1n", "separator=comma"]
-        success, stdout, stderr = run_grass_cmd(stats_cmd)
-
-        if success and stdout:
-            # Создаем словарь для быстрого поиска по координатам
-            stats_dict = {}
-            for line in stdout.strip().split('\n'):
-                if line and ',' in line:
-                    parts = line.split(',')
-                    if len(parts) >= 4:
-                        try:
-                            x = float(parts[0])
-                            y = float(parts[1])
-                            val = float(parts[3])
-                            stats_dict[(round(x, 1), round(y, 1))] = val
-                        except:
-                            pass
-
-            # Ищем ближайшие точки
-            for idx, point in points_gdf.iterrows():
-                px, py = point.geometry.x, point.geometry.y
-                # Ищем точное или ближайшее совпадение
-                found = False
-                for (rx, ry), val in stats_dict.items():
-                    if abs(rx - px) < 50 and abs(ry - py) < 50:  # в пределах половины ячейки
-                        G_values[point['cat']] = val
-                        found = True
-                        break
-
-                if not found:
-                    # Берем среднее значение
-                    if stats_dict:
-                        G_values[point['cat']] = sum(stats_dict.values()) / len(stats_dict)
-
-            print(f"    Получено {len(G_values)} значений через r.stats")
-
-    # СПОСОБ 3: Если всё ещё нет значений, используем среднее по рару
-    if not G_values:
-        print("  Способ 3: Использование среднего значения...")
-        univar_cmd = ["r.univar", f"map={rad_name}", "flags=g"]
-        success, stdout, stderr = run_grass_cmd(univar_cmd)
-
-        mean_val = 500  # значение по умолчанию
-        if success and stdout:
-            for line in stdout.split('\n'):
-                if 'mean:' in line:
-                    try:
-                        mean_val = float(line.split(':')[1].strip())
-                        break
-                    except:
-                        pass
-
-        print(f"    Среднее значение: {mean_val:.1f}")
-
-        # Используем среднее для всех точек
-        for idx, point in points_gdf.iterrows():
-            # Добавляем небольшую вариацию по высоте
-            height_factor = 1.0 + (point['z'] - 2500) / 1000 * 0.1
-            G_values[point['cat']] = mean_val * height_factor
-
-        print(f"    Создано {len(G_values)} аппроксимированных значений")
-
-    # Очистка растра
-    cleanup_cmd = ["g.remove", "-f", "type=raster", f"name={rad_name}"]
-    run_grass_cmd(cleanup_cmd)
+    for line in result.stdout.split("\n")[1:]:
+        if "|" in line:
+            cat, g = line.split("|")
+            G_values[int(cat)] = float(g)
 
     return G_values
 
-
-def load_aws_data(excel_file="Test_model.xlsx"):
-    """
-    Загружает метеоданные с AWS2
-    """
-    print(f"Загрузка метеоданных из {excel_file}...")
-
+# Проверка CRS файлов
+def check_coordinate_systems():
+    """Проверяет системы координат всех файлов"""
     try:
-        # Пытаемся загрузить с правильным форматом
-        df = pd.read_excel(excel_file, sheet_name="AWS2_30min", header=2)
+        with rasterio.open(CONFIG["dem_tif"]) as dem:
+            print(f"DEM CRS: {dem.crs}")
+            print(f"DEM Transform: {dem.transform}")
+            print(f"DEM Bounds: {dem.bounds}")
 
-        # Переименовываем столбцы
-        column_mapping = {
-            'X': 'x',
-            'Y': 'y',
-            'Z': 'z',
-            'Sin': 'Sin',
-            'Sout': 'Sout',
-            'Lin': 'Lin',
-            'T2m': 'T2m',
-            'RH2m': 'RH',
-            'W2m': 'wind_speed',
-            'p': 'pressure',
-            'Prec': 'precipitation',
-            'α': 'alpha'
-        }
+        glacier_gdf = gpd.read_file(CONFIG["glacier_shp"])
+        print(f"Glacier CRS: {glacier_gdf.crs}")
+        print(f"Glacier bounds: {glacier_gdf.total_bounds}")
 
-        # Применяем переименование только для существующих столбцов
-        rename_dict = {old: new for old, new in column_mapping.items() if old in df.columns}
-        df = df.rename(columns=rename_dict)
+        # Если координаты не совпадают с ожидаемыми, возможно нужно преобразование
+        expected_bounds = [525000, 6300000, 526000, 6301000]  # Примерные ожидаемые границы
 
-        # Создаем временные метки
-        start_date = pd.to_datetime(CONFIG["period_start"])
-        df['datetime'] = [start_date + pd.Timedelta(minutes=30 * i) for i in range(len(df))]
-
-        print(f"✓ Загружено {len(df)} записей")
-        return df
+        return True
 
     except Exception as e:
-        print(f"✗ Ошибка загрузки: {e}")
-        # Создаем тестовые данные
-        return create_test_aws_data()
+        print(f"Ошибка проверки координат: {e}")
+        return False
 
 
-def create_test_aws_data():
-    """Создает тестовые метеоданные для отладки"""
-    print("Создание тестовых метеоданных...")
-
-    start = pd.to_datetime(CONFIG["period_start"])
-    end = pd.to_datetime(CONFIG["period_end"])
-    dates = pd.date_range(start, end, freq='30min')
-
-    data = []
-    for date in dates:
-        hour = date.hour
-        # Синусоидальная дневная температура
-        if 6 <= hour <= 18:
-            temp = 8 + 6 * np.sin((hour - 6) * np.pi / 12)
-        else:
-            temp = 2
-
-        # Радиация (только днем)
-        if 4 <= hour <= 20:
-            sin_val = 500 * np.sin((hour - 4) * np.pi / 16)
-        else:
-            sin_val = 0
-
-        data.append({
-            'datetime': date,
-            'Sin': max(0, sin_val),
-            'Sout': max(0, sin_val * 0.3),
-            'Lin': 300,
-            'T2m': temp,
-            'RH': 70,
-            'wind_speed': 3,
-            'pressure': 850,
-            'precipitation': 0,
-            'alpha': 0.5
-        })
-
-    return pd.DataFrame(data)
-
-
-def get_aws_at_time(aws_df, target_datetime):
+# ==================== КЛЮЧЕВЫЕ ФИКСЫ ДЛЯ РАСЧЕТА SIN_CELL ====================
+def get_sunrise_sunset_times_from_excel():
     """
-    Получает метеоданные для конкретного времени
+    Получаем точные времена восхода и захода из предоставленных данных Excel
+    Анализ данных показывает:
+    - Начало дневной радиации: ~04:00 (первые ненулевые значения)
+    - Конец дневной радиации: ~20:30 (последние ненулевые значения)
+    - Пик в районе 12:00-13:00
     """
-    mask = aws_df['datetime'] == target_datetime
-    if mask.any():
-        return aws_df[mask].iloc[0].to_dict()
-    else:
-        # Интерполяция по времени
-        time_diff = abs(aws_df['datetime'] - target_datetime)
-        closest_idx = time_diff.idxmin()
-        return aws_df.loc[closest_idx].to_dict()
+    # Из предоставленных данных: первые ненулевые значения в 4:00
+    sunrise = 4.0  # 04:00
+    sunset = 20.5  # 20:30
+
+    return sunrise, sunset
 
 
-def compute_T2m_at_z(T2m_aws2, kt, z_cell, z_aws2):
-    """Температура воздуха на высоте ячейки (формула 11)"""
-    return T2m_aws2 + kt * (z_cell - z_aws2)
-
-
-def compute_Sin_cell(Sin_aws2, G_cell, G_aws2):
-    """Приходящая коротковолновая радиация в ячейке (формула 1)"""
-    if G_aws2 <= 0 or Sin_aws2 <= 0:
-        return 0.0
-    return Sin_aws2 * (G_cell / G_aws2)
-
-
-def compute_albedo(ST, T2m, Ta, kSS, kT2m, kTa, c_alpha):
-    """Альбедо поверхности (формула 7)"""
-    albedo = kSS * ST + kT2m * T2m + kTa * Ta + c_alpha
-    return max(0.1, min(0.9, albedo))
-
-
-def compute_Sout(alpha, Sin):
-    """Отраженная коротковолновая радиация (формула 8)"""
-    return alpha * Sin
-
-
-def compute_Lout(epsilon, sigma, Qm, ST):
-    """Длинноволновое излучение поверхности (формула 10)"""
-    if Qm > 0:
-        Ts_K = 273.15  # 0°C при таянии
-    else:
-        if ST == 1:  # снег
-            Ts_K = 271.15  # -2°C
-        else:  # лед
-            Ts_K = 272.15  # -1°C
-
-    return epsilon * sigma * (Ts_K ** 4), Ts_K - 273.15
-
+def is_night_time_corrected(time_decimal):
+    """
+    Корректная проверка - ночь ли сейчас, основанная на данных Excel
+    """
+    sunrise, sunset = get_sunrise_sunset_times_from_excel()
+    return time_decimal < sunrise or time_decimal > sunset
 
 def compute_vapor_pressure(T2m, RH, p):
-    """Давление водяного пара (формула 15)"""
-    T_C = T2m
-    term1 = 6.112 * math.exp(17.62 * T_C / (243.12 + T_C))
+    """
+    ПРАВИЛЬНАЯ формула из документации:
+    e(z,t) = 6.112 × exp(17.62 × T2m / (243.12 + T2m)) ×
+              (1.0016 + 0.0000315 × p - 0.074 / p) × RH / 100
+    """
+    term1 = 6.112 * math.exp(17.62 * T2m / (243.12 + T2m))
     term2 = 1.0016 + 0.0000315 * p - 0.074 / p
     return term1 * term2 * (RH / 100)
 
 
-def compute_richardson(T2m, Ts, wind_speed, zm=2.0, z0m=0.001):
-    """Число Ричардсона (формула 16)"""
+def compute_Sin_cell_corrected(Sin_AWS2, G_cell, G_AWS2):
+    """
+    ИСПРАВЛЕННАЯ формула для расчета Sin_cell:
+    Sin(z,t) = Sin(AWS2,t) * G(z,t) / G(AWS2,t)
+
+    С обработкой крайних случаев:
+    1. Если G_AWS2 близко к 0, но Sin_AWS2 > 0 (сумерки, рассеянный свет)
+    2. Если G_cell близко к 0 (точка в тени)
+    3. Ночные условия
+    """
+    if G_AWS2 <= 0.1 or Sin_AWS2 <= 0:
+        return 0.0
+
+        # САМАЯ ПРОСТАЯ ФОРМУЛА
+    sin_cell = Sin_AWS2 * (G_cell / G_AWS2)
+
+    # Не делаем никаких дополнительных проверок!
+    return max(0.0, sin_cell)
+
+
+def compute_albedo(ST, T2m, Ta, k_ST, k_T2m, k_Ta, c_alpha):
+    """Альбедо поверхности"""
+    albedo = k_ST * ST + k_T2m * T2m + k_Ta * Ta + c_alpha
+    return max(0.1, min(0.9, albedo))
+
+
+def compute_Sout(alpha, Sin):
+    """Отраженная коротковолновая радиация"""
+    return alpha * Sin
+
+
+def compute_Lin_realistic(T2m_pt, RH, time_decimal, cloud_cover=0.3):
+    """Длинноволновое излучение атмосферы"""
+    try:
+        T_K = 273.15 + T2m_pt
+        base_emissivity = 0.7 + 0.06 * (RH / 100)
+        time_factor = 0.9 + 0.1 * (1 - min(1, abs(time_decimal - 12) / 6))
+        cloud_factor = 1 + 0.2 * cloud_cover
+        atmospheric_emissivity = min(0.95, base_emissivity * time_factor * cloud_factor)
+        Lin = atmospheric_emissivity * 5.670374419e-8 * (T_K ** 4)
+        return Lin
+    except:
+        return 300
+
+
+def compute_Lout_corrected(epsilon, sigma, ST, Qm):
+    """Длинноволновое излучение поверхности"""
+    """
+    ПРАВИЛЬНАЯ формула из документации:
+    Lout(z,t) = εσTs(z)⁴
+    При Qm > 0 температура поверхности = 0°C (273.15K)
+    """
+    try:
+        # КРИТИЧЕСКОЕ ИСПРАВЛЕНИЕ: температура поверхности = 0°C при таянии
+        if Qm > 0:
+            Ts_K = 273.15  # 0°C при таянии
+        else:
+            # Если нет таяния, используем приближенную температуру
+            # Для снега холоднее, для льда ближе к 0
+            if ST == 1:  # снег
+                Ts_K = 271.15  # -2°C
+            else:  # лед
+                Ts_K = 272.15  # -1°C
+
+        Lout = epsilon * sigma * (Ts_K ** 4)
+        Ts_C = Ts_K - 273.15
+        return Lout, Ts_C
+    except:
+        return epsilon * sigma * (273.15 ** 4), 0
+
+
+def compute_T2m_at_z(T2m_aws2, kt, z_cell, z_aws2):
+    """Температура воздуха на высоте ячейки"""
+    return T2m_aws2 + kt * (z_cell - z_aws2)
+
+
+def compute_Rnet(Sin, Sout, Lin, Lout):
+    """Радиационный баланс"""
+    Snet = Sin - Sout
+    Lnet = Lin - Lout
+    return Snet + Lnet, Snet, Lnet
+
+
+def compute_pressure_at_z(p_aws1, z_cell, z_aws1, T_layer):
+    """
+    ПРАВИЛЬНАЯ формула из документации:
+    p(z,t) = p(AWS1,t) / 10^((z - z(AWS1)) / (18400 * (1 + 0.003665 * T)))
+    """
+    denominator = 18400 * (1 + 0.003665 * T_layer)
+    exponent = (z_cell - z_aws1) / denominator
+    return p_aws1 / (10 ** exponent)
+
+
+def compute_dimensionless_functions(Rib):
+    """
+    Формула 17: Безразмерные функции
+    """
+    if Rib > 0:  # стабильные условия
+        phi_inv = (1 - 5 * Rib) ** 2
+    else:  # нестабильные условия
+        phi_inv = (1 - 16 * Rib) ** 0.75
+
+    return phi_inv  # возвращает (Φ_m Φ_t)^{-1} = (Φ_m Φ_h)^{-1}
+
+
+def compute_turbulent_heat_corrected(T2m_pt, Ts_C, wind_speed, pressure, RH, z,
+                                     z0m=0.001, z0t=0.0001, z0h=0.0001, zm=2.0):
+    """
+    ПРАВИЛЬНЫЕ формулы 18 и 19 для явного (H) и скрытного (LE) тепла
+    """
+    # Константы
+    cp = 1005  # Дж/(кг·K)
+    rho0 = 1.225  # кг/м³
+    p0 = 1013.25  # гПа
+    k = 0.4  # постоянная Кармана
+    L_v = 2.83e6  # скрытая теплота испарения снега/льда (Дж/кг)
+    e_s = 6.11  # давление пара на поверхности при 0°C (гПа)
+
+    T2m_K = T2m_pt + 273.15
+    Ts_K = Ts_C + 273.15
+
     if wind_speed <= 0.5:
-        return None
-
-    T2m_K = T2m + 273.15
-    Ts_K = Ts + 273.15
-    delta_T = T2m - Ts
-    g = 9.81
-
-    Rib = g * delta_T * (zm - z0m) / (T2m_K * wind_speed ** 2)
-    return Rib
-
-
-def compute_phi_functions(Rib):
-    """Безразмерные функции (формула 17)"""
-    Rib_cr = 0.4
-
-    if abs(Rib) >= Rib_cr or Rib is None:
-        return 0
-
-    if Rib > 0:  # стабильные
-        return (1 - 5 * Rib) ** 2
-    else:  # нестабильные
-        return (1 - 16 * Rib) ** 0.75
-
-
-def compute_turbulent_heat(T2m, Ts, wind_speed, pressure, RH, Rib,
-                           p0=1013.25, rho0=1.225, cp=1005, k=0.4,
-                           Lv=2.83e6, es=6.11, zm=2.0, z0m=0.001,
-                           z0t=0.0001, z0h=0.0001):
-    """Явное (H) и скрытое (LE) тепло (формулы 18, 19)"""
-    if wind_speed <= 0.5 or Rib is None or Rib >= 0.4:
         return 0, 0
 
-    phi_inv = compute_phi_functions(Rib)
-    if phi_inv == 0:
+    # Число Ричардсона
+    delta_T = T2m_pt - Ts_C
+    Rib = (9.81 * delta_T * (zm - z0m)) / (T2m_K * wind_speed ** 2)
+
+    if Rib >= 0.4:
         return 0, 0
 
-    # Явное тепло H
-    delta_T = T2m - Ts
+    # Безразмерные функции (Формула 17)
+    phi_inv = compute_dimensionless_functions(Rib)
+
+    # ПРАВИЛЬНАЯ формула 18 для H
     H = (cp * rho0 * (pressure / p0) * (k ** 2) * wind_speed * delta_T *
          phi_inv / (math.log(zm / z0m) * math.log(zm / z0t)))
 
-    # Скрытое тепло LE
-    e_air = compute_vapor_pressure(T2m, RH, pressure)
-    delta_e = e_air - es
-    LE = (0.623 * Lv * rho0 * (1 / p0) * (k ** 2) * wind_speed * delta_e *
+    # ПРАВИЛЬНАЯ формула 19 для LE
+    # Давление пара в воздухе (из формулы 15)
+    e_air = compute_vapor_pressure(T2m_pt, RH, pressure)
+    delta_e = e_air - e_s
+
+    LE = (0.623 * L_v * rho0 * (1 / p0) * (k ** 2) * wind_speed * delta_e *
           phi_inv / (math.log(zm / z0m) * math.log(zm / z0h)))
 
     return H, LE
 
 
-def compute_rain_heat(T2m, Ts, precipitation):
-    """Тепло от жидких осадков (формула 20)"""
-    if T2m < 2 or precipitation <= 0:
+def compute_rain_heat_corrected(T2m_pt, Ts_C, precipitation_rate):
+    """
+    ПРАВИЛЬНАЯ формула 20:
+    Qr(z,t) = ρ_w × c_w × r × (T_zm - T_s)
+    """
+    if T2m_pt < 2 or precipitation_rate <= 0:
         return 0
 
-    rho_w = 1000  # кг/м³
-    cw = 4186  # Дж/(кг·K)
+    try:
+        rho_water = 1000  # кг/м³
+        cp_water = 4186  # Дж/(кг·K)
 
-    # Конвертация мм/шаг в м/с
-    precip_ms = precipitation / 1000 / 1800  # за 30 мин
+        # Преобразование мм/ч в м/с
+        precip_ms = precipitation_rate / 3600 / 1000
 
-    return rho_w * cw * precip_ms * (T2m - Ts)
+        Qr = rho_water * cp_water * precip_ms * (T2m_pt - Ts_C)
+        return Qr
+    except:
+        return 0
 
 
-def compute_ground_heat(ST, Ts):
-    """Теплообмен с ледником (формула 21)"""
-    if ST == 1:  # снег
-        k_r = 0.2
-        T_g = 271.15  # -2°C
-    else:  # лед
-        k_r = 2.2
-        T_g = 272.15  # -1°C
+def compute_ground_heat_corrected(ST, T_surface, time_decimal=None,
+                                  k_r_snow=0.2, k_r_ice=2.2,
+                                  T_g=273.15, z_g=0.1, z_0=0.01):
+    """
+    ПРАВИЛЬНАЯ формула 21:
+    Qg = -k_r × (T_g - T_s) / (z_g - z_0)
+    """
+    try:
+        # Выбираем теплопроводность в зависимости от типа поверхности
+        if ST == 1:  # снег
+            k_r = k_r_snow
+            # Для снега температура ледника обычно ниже
+            T_g_deep = 271.15  # -2°C
+        else:  # лед
+            k_r = k_r_ice
+            T_g_deep = 272.15  # -1°C
 
-    z_g = 0.1  # глубина (м)
-    z_0 = 0.01  # толщина поверхностного слоя (м)
+        # Преобразуем температуру поверхности в Кельвины
+        T_s_K = T_surface + 273.15
 
-    Ts_K = Ts + 273.15
-    return -k_r * (T_g - Ts_K) / (z_g - z_0)
+        # Расчет по формуле
+        Qg = -k_r * (T_g_deep - T_s_K) / (z_g - z_0)
+
+        return Qg
+    except:
+        # Fallback значение
+        if ST == 1:
+            return -5
+        else:
+            return -10
 
 
 def compute_melting_heat(Sin, Sout, Lin, Lout, H, LE, Qr, Qg):
-    """Тепло на таяние (формула 22)"""
-    Qm = Sin - Sout + Lin - Lout + H + LE + Qr + Qg
-    return max(0, Qm)
+    """
+    ПРАВИЛЬНАЯ формула 22 из документации:
+    Qm(z,t) = Sin + Sout + Lin + Lout + H + LE + Qr + Qg
+    """
+    Qm = Sin + Sout + Lin + Lout + H + LE + Qr + Qg
+    return max(0, Qm)  # Таяние только когда Qm > 0
 
 
-def compute_ablation(Qm, ST, time_step=1800, L_fs=334000, L_fi=334000):
-    """Абляция в мм в.э. (формула 23)"""
+def compute_ablation_corrected(Qm, ST, time_step_seconds, rho_snow, rho_ice, L_fs, L_fi):
+    """
+    ПРАВИЛЬНАЯ формула 23:
+    A(z,t) = (Qm(z,t) × t_mod / L_f(s,i)) × 1000
+    """
     if Qm <= 0:
         return 0
 
-    L_f = L_fs if ST == 1 else L_fi
-    rho_w = 1000  # кг/м³
+    try:
+        # Выбираем параметры в зависимости от типа поверхности
+        if ST == 1:  # снег
+            L_f = L_fs
+            rho = rho_snow
+        else:  # лед
+            L_f = L_fi
+            rho = rho_ice
 
-    # Энергия таяния за шаг (Дж/м²)
-    energy = Qm * time_step
+        # Энергия таяния за временной шаг (Дж/м²)
+        melting_energy = Qm * time_step_seconds
 
-    # Масса растаявшего вещества (кг/м²)
-    mass = energy / L_f
+        # Масса расплавленного вещества (кг/м²)
+        melted_mass = melting_energy / L_f
 
-    # Объем воды (м³/м²)
-    volume = mass / rho_w
+        # Объем воды (м³/м² = м)
+        water_volume = melted_mass / 1000  # делим на плотность воды 1000 кг/м³
 
-    # в мм
-    return volume * 1000
+        # Абляция в мм воды
+        ablation_mm = water_volume * 1000
 
-
-def check_glacier_overlap(dem_tif, glacier_shp):
-    """
-    Проверяет перекрытие DEM и границ ледника
-    """
-    print("\n=== ПРОВЕРКА ПЕРЕКРЫТИЯ DEM И ЛЕДНИКА ===")
-
-    # Открываем DEM
-    src = rasterio.open(dem_tif)
-    print(f"DEM CRS: {src.crs}")
-    print(f"DEM bounds: {src.bounds}")
-    print(f"DEM размер: {src.width} x {src.height}")
-    print(f"DEM ячеек: {src.width * src.height}")
-
-    # Читаем небольшой участок DEM для проверки
-    dem_data = src.read(1)
-    valid_cells = np.sum((dem_data > -999) & (dem_data < 10000))
-    print(f"Ячеек с валидными высотами: {valid_cells}")
-
-    # Проверяем шейп-файл
-    glacier_gdf = gpd.read_file(glacier_shp)
-    print(f"\nGlacier CRS: {glacier_gdf.crs}")
-    print(f"Glacier bounds: {glacier_gdf.total_bounds}")
-    print(f"Количество полигонов: {len(glacier_gdf)}")
-
-    # Если CRS разные, пробуем преобразовать
-    if glacier_gdf.crs != src.crs:
-        print(f"\n⚠ CRS различаются!")
-        print(f"Преобразуем glacier в CRS DEM...")
-        glacier_gdf = glacier_gdf.to_crs(src.crs)
-        print(f"После преобразования bounds: {glacier_gdf.total_bounds}")
-
-    # Проверяем перекрытие
-    dem_bounds = src.bounds
-    glacier_bounds = glacier_gdf.total_bounds
-
-    overlap_x = not (glacier_bounds[2] < dem_bounds[0] or glacier_bounds[0] > dem_bounds[2])
-    overlap_y = not (glacier_bounds[3] < dem_bounds[1] or glacier_bounds[1] > dem_bounds[3])
-
-    if overlap_x and overlap_y:
-        print("\n✅ DEM и ледник перекрываются!")
-
-        # Создаем пробную точку в центре ледника
-        center_x = (glacier_bounds[0] + glacier_bounds[2]) / 2
-        center_y = (glacier_bounds[1] + glacier_bounds[3]) / 2
-        test_point = gpd.points_from_xy([center_x], [center_y])[0]
-
-        # Проверяем каждую часть мультиполигона
-        point_inside = False
-        for geom in glacier_gdf.geometry:
-            if geom.contains(test_point):
-                point_inside = True
-                break
-
-        if point_inside:
-            print("✅ Центр ледника находится внутри полигона")
-        else:
-            print("❌ Центр ледника НЕ внутри полигона")
-            print("  Возможно, ледник состоит из нескольких отдельных полигонов")
-
-    else:
-        print("\n❌ DEM и ледник НЕ перекрываются!")
-        print(f"DEM X: [{dem_bounds[0]:.0f}, {dem_bounds[2]:.0f}]")
-        print(f"DEM Y: [{dem_bounds[1]:.0f}, {dem_bounds[3]:.0f}]")
-        print(f"Glacier X: [{glacier_bounds[0]:.0f}, {glacier_bounds[2]:.0f}]")
-        print(f"Glacier Y: [{glacier_bounds[1]:.0f}, {glacier_bounds[3]:.0f}]")
-
-    return glacier_gdf, src, dem_data  # Возвращаем всё, включая открытый src и данные
+        return ablation_mm
+    except:
+        return 0
 
 
+# ==================== СОЗДАНИЕ ТОЧЕК ИССЛЕДОВАНИЯ ====================
 def create_research_points(dem_tif, glacier_shp, num_points=100):
     """
-    Создает точки для исследования с улучшенной диагностикой
+    ИСПРАВЛЕНО: Шаг перебора 1, чтобы найти все 100 точек.
     """
-    print(f"\nСоздание {num_points} точек на леднике...")
+    print(f"Создаем точки (цель: {num_points} шт) с фиксированными 94 и 96...")
 
-    # Проверяем перекрытие и получаем открытый файл
-    glacier_gdf, src, dem_data = check_glacier_overlap(dem_tif, glacier_shp)
-
-    points = []
-
-    # Стратегия 1: ищем по всему DEM
-    print("\nСтратегия 1: Поиск по всему DEM...")
-    found = 0
-
-    # Получаем bounding box ледника для ускорения
-    bounds = glacier_gdf.total_bounds
-    minx, miny, maxx, maxy = bounds
-
-    # Преобразуем границы в индексы растра
     try:
-        row_min, col_min = src.index(minx, maxy)  # верхний левый
-        row_max, col_max = src.index(maxx, miny)  # нижний правый
+        with rasterio.open(dem_tif) as src:
+            glacier_gdf = gpd.read_file(glacier_shp)
+            if glacier_gdf.crs != src.crs:
+                glacier_gdf = glacier_gdf.to_crs(src.crs)
 
-        # Нормализуем индексы
-        row_start = max(0, min(row_min, row_max))
-        row_end = min(src.height, max(row_min, row_max) + 1)
-        col_start = max(0, min(col_min, col_max))
-        col_end = min(src.width, max(col_min, col_max) + 1)
+            points = []
 
-        print(f"  Область поиска по bounding box: строки {row_start}-{row_end - 1}, колонки {col_start}-{col_end - 1}")
-    except:
-        # Если не удалось преобразовать, ищем по всему DEM
-        row_start, row_end = 0, src.height
-        col_start, col_end = 0, src.width
-        print(f"  Область поиска: весь DEM")
+            # --- Вспомогательная функция ---
+            def add_special_point(target_x, target_y, cat_id):
+                # Ищем ближайшую ячейку (грубый поиск)
+                closest_dist = float('inf')
+                closest_cell = None
 
-    for j in range(row_start, row_end):
-        for i in range(col_start, col_end):
-            # Пропускаем невалидные ячейки
-            if dem_data[j, i] <= src.nodata or dem_data[j, i] < -999 or dem_data[j, i] > 10000:
-                continue
+                # Используем шаг 10 для быстрого поиска области
+                for j in range(0, src.height, 10):
+                    for i in range(0, src.width, 10):
+                        x, y = src.xy(j, i)
+                        dist = np.sqrt((x - target_x) ** 2 + (y - target_y) ** 2)
+                        if dist < closest_dist:
+                            closest_dist = dist
+                            closest_cell = (i, j)
 
-            # Получаем координаты центра ячейки
-            x, y = src.xy(j, i)
+                # Точный поиск вокруг найденной области
+                if closest_cell:
+                    ci, cj = closest_cell
+                    best_cell = None
+                    best_dist = float('inf')
+                    for j in range(max(0, cj - 15), min(src.height, cj + 15)):
+                        for i in range(max(0, ci - 15), min(src.width, ci + 15)):
+                            x, y = src.xy(j, i)
+                            dist = np.sqrt((x - target_x) ** 2 + (y - target_y) ** 2)
+                            if dist < best_dist:
+                                best_dist = dist
+                                best_cell = (i, j, x, y)
 
-            # Проверяем, попадает ли точка в ледник
-            point_geom = gpd.points_from_xy([x], [y])[0]
+                    if best_cell:
+                        i, j, x, y = best_cell
+                        # Читаем высоту
+                        window = rasterio.windows.Window(i, j, 1, 1)
+                        z = src.read(1, window=window)[0, 0]
+                        if z > -9999:
+                            point_geom = gpd.points_from_xy([x], [y])[0]
+                            return {
+                                'cat': cat_id, 'x': x, 'y': y, 'z': z,
+                                'row': j, 'col': i, 'geometry': point_geom
+                            }
+                return None
 
-            try:
-                # Проверяем по всем полигонам
-                for geom in glacier_gdf.geometry:
-                    if geom.contains(point_geom):
-                        cat = len(points) + 1
-                        points.append({
-                            'cat': cat,
-                            'x': x,
-                            'y': y,
-                            'z': float(dem_data[j, i]),
-                            'row': j,
-                            'col': i,
-                            'geometry': point_geom
-                        })
-                        found += 1
-                        break  # Выходим из цикла по полигонам
+            # 1. Добавляем точку 94
+            p94 = add_special_point(525285, 6300765, 94)
+            if p94: points.append(p94)
 
-                if len(points) >= num_points:
-                    break
-            except Exception as e:
-                continue
+            # 2. Добавляем точку 96 (AWS2)
+            p96 = add_special_point(525290, 6300770, 96)
+            if p96: points.append(p96)
 
-        if len(points) >= num_points:
-            break
+            # 3. Добавляем остальные точки (шаг 1!)
+            cat_counter = 1
 
-    print(f"  Найдено {found} точек внутри ледника")
+            # ВАЖНО: шаг 1, а не 2, чтобы собрать все точки
+            for j in range(0, src.height, 1):
+                for i in range(0, src.width, 1):
+                    # Пропускаем номера, занятые спец. точками
+                    while cat_counter == 94 or cat_counter == 96:
+                        cat_counter += 1
 
-    # Если не нашли точек, выводим отладочную информацию
-    if found == 0:
-        print("\n❌ НЕ НАЙДЕНО ТОЧЕК ВНУТРИ ЛЕДНИКА!")
-        print("\nОтладочная информация:")
-
-        # Проверяем первые несколько ячеек в bounding box
-        print(f"\nПроверка первых 10 ячеек в области поиска:")
-        check_count = 0
-        for j in range(row_start, min(row_start + 5, row_end)):
-            for i in range(col_start, min(col_start + 5, col_end)):
-                if j < src.height and i < src.width:
                     x, y = src.xy(j, i)
-                    z = dem_data[j, i]
                     point_geom = gpd.points_from_xy([x], [y])[0]
 
-                    inside = False
-                    for geom in glacier_gdf.geometry:
-                        if geom.contains(point_geom):
-                            inside = True
-                            break
+                    # Проверка попадания в ледник
+                    if glacier_gdf.contains(point_geom).any():
+                        window = rasterio.windows.Window(i, j, 1, 1)
+                        z = src.read(1, window=window)[0, 0]
 
-                    print(f"    Ячейка [{j},{i}]: x={x:.0f}, y={y:.0f}, z={z:.1f}, внутри ледника: {inside}")
-                    check_count += 1
-
-        # Если ни одной точки не внутри, возможно проблема с ориентацией полигона
-        print("\nВозможные причины:")
-        print("1. Полигоны в шейп-файле ориентированы неправильно (self-intersection)")
-        print("2. В шейп-файле мультиполигон с дырками")
-        print("3. Координаты точек находятся на границе, а contains требует строгого внутри")
-
-        # Пробуем использовать within вместо contains
-        print("\nСтратегия 2: Использование within вместо contains...")
-        for j in range(row_start, row_end):
-            for i in range(col_start, col_end):
-                if dem_data[j, i] <= src.nodata:
-                    continue
-
-                x, y = src.xy(j, i)
-                point_geom = gpd.points_from_xy([x], [y])[0]
-
-                # Пробуем within
-                if point_geom.within(glacier_gdf.geometry.iloc[0]):
-                    cat = len(points) + 1
-                    points.append({
-                        'cat': cat,
-                        'x': x,
-                        'y': y,
-                        'z': float(dem_data[j, i]),
-                        'row': j,
-                        'col': i,
-                        'geometry': point_geom
-                    })
-                    if len(points) >= num_points:
-                        break
-            if len(points) >= num_points:
-                break
-
-        if points:
-            print(f"  Найдено {len(points)} точек через within!")
-
-    # Если всё равно нет точек, создаем тестовые
-    if not points:
-        print("\nСоздаем тестовые точки на основе bounding box ледника...")
-
-        # Берем точки из bounding box
-        x_step = (maxx - minx) / 10
-        y_step = (maxy - miny) / 10
-
-        for ix in range(10):
-            for iy in range(10):
-                test_x = minx + ix * x_step + x_step / 2
-                test_y = miny + iy * y_step + y_step / 2
-
-                try:
-                    row, col = src.index(test_x, test_y)
-                    if 0 <= row < src.height and 0 <= col < src.width:
-                        z = float(dem_data[row, col])
-                        if z > -999 and z < 10000:
-                            point_geom = gpd.points_from_xy([test_x], [test_y])[0]
+                        if not np.isnan(z) and z > -9999:
                             points.append({
-                                'cat': len(points) + 1,
-                                'x': test_x,
-                                'y': test_y,
-                                'z': z,
-                                'row': row,
-                                'col': col,
+                                'cat': cat_counter,
+                                'x': x, 'y': y, 'z': z,
+                                'row': j, 'col': i,
                                 'geometry': point_geom
                             })
-                except:
-                    continue
+                            cat_counter += 1
 
+                    if len(points) >= num_points:
+                        break
                 if len(points) >= num_points:
                     break
-            if len(points) >= num_points:
-                break
 
-        print(f"  Создано {len(points)} тестовых точек")
+            points_gdf = gpd.GeoDataFrame(points, crs=src.crs)
+            print(f"✓ Успешно создано точек: {len(points_gdf)}")
+            return points_gdf
 
-    # Создаем GeoDataFrame
-    if points:
-        points_gdf = gpd.GeoDataFrame(points, crs=src.crs, geometry='geometry')
-        print(f"\n✅ ИТОГО создано точек: {len(points_gdf)}")
-        print(f"  Диапазон высот: {points_gdf['z'].min():.1f} - {points_gdf['z'].max():.1f} м")
-        print(f"  Диапазон X: {points_gdf['x'].min():.0f} - {points_gdf['x'].max():.0f}")
-        print(f"  Диапазон Y: {points_gdf['y'].min():.0f} - {points_gdf['y'].max():.0f}")
+    except Exception as e:
+        print(f"✗ Ошибка создания точек: {e}")
+        import traceback
+        traceback.print_exc()
+        return gpd.GeoDataFrame()
 
-        # Закрываем DEM
-        src.close()
-        return points_gdf
-    else:
-        print("\n❌ НЕ УДАЛОСЬ СОЗДАТЬ ТОЧКИ!")
-        src.close()
-        return gpd.GeoDataFrame(columns=['cat', 'x', 'y', 'z', 'row', 'col', 'geometry'], crs=src.crs)
 
-def run_glacier_model():
+# ==================== ЗАГРУЗКА РЕАЛЬНЫХ МЕТЕОДАННЫХ ====================
+def load_real_aws_data(excel_file="test_model.xlsx", sheet_name="AWS2_30min"):
     """
-    Основная функция модели
+    Загружает реальные метеоданные из Excel файла
     """
-    print("=" * 70)
-    print("ЗАПУСК МОДЕЛИ АБЛЯЦИИ ЛЕДНИКА")
-    print("=" * 70)
+    try:
+        print(f"Загружаем реальные метеоданные из {excel_file}...")
 
-    # Создаем выходную директорию
-    ensure_dir(CONFIG["output_dir"])
+        df = pd.read_excel(excel_file, sheet_name=sheet_name, header=2)
 
-    # Настраиваем GRASS
-    gisdb, location, mapset, grass_bat = setup_grass_environment()
-    if not gisdb:
-        print("✗ Не удалось настроить GRASS. Выход.")
-        return
+        print(f"Столбцы ДО переименования: {df.columns.tolist()}")
 
-    # Загружаем метеоданные
-    aws_df = load_aws_data()
+        column_mapping = {
+            'Sin': 'Sin_AWS2',
+            'Sout': 'Sout_AWS2',
+            'Lin': 'Lin_AWS2',
+            'T2m': 'T2m_AWS2',
+            'RH2m': 'RH_AWS2',
+            'W2m': 'wind_speed',
+            'p': 'pressure',
+            'Prec': 'precipitation',
+            'α': 'alpha_AWS2'
+        }
 
-    if not os.path.exists(CONFIG["dem_tif"]):
-        print(f"✗ DEM файл не найден: {CONFIG['dem_tif']}")
-        return
+        df = df.rename(columns=column_mapping)
 
-    if not os.path.exists(CONFIG["glacier_shp"]):
-        print(f"✗ Shapefile не найден: {CONFIG['glacier_shp']}")
-        return
+        # === ОТЛАДКА: показываем данные для 7 июля ===
+        if 'Дата&Время' in df.columns:
+            df['datetime'] = pd.to_datetime(df['Дата&Время'])
 
-    # Создаем точки
-    points_gdf = create_research_points(CONFIG["dem_tif"], CONFIG["glacier_shp"])
+        # Фильтруем 7 июля
+        july7 = df[df['datetime'].dt.date == pd.to_datetime('2019-07-07').date()]
+
+        print(f"\n=== ДАННЫЕ ЗА 7 ИЮЛЯ ===")
+        print(f"Найдено записей: {len(july7)}")
+
+        if len(july7) > 0:
+            print(f"\nПервые 10 записей 7 июля:")
+            for i, (idx, row) in enumerate(july7.head(10).iterrows()):
+                time_str = row['datetime'].strftime('%H:%M')
+                sin_val = row['Sin_AWS2']
+                print(f"  {time_str}: Sin_AWS2 = {sin_val}")
+
+            # Проверяем полдень
+            noon = july7[july7['datetime'].dt.hour == 12]
+            print(f"\nДанные в 12:00-12:30:")
+            for idx, row in noon.iterrows():
+                time_str = row['datetime'].strftime('%H:%M')
+                sin_val = row['Sin_AWS2']
+                print(f"  {time_str}: Sin_AWS2 = {sin_val}")
+
+        print(f"=== КОНЕЦ ОТЛАДКИ ===\n")
+        # === КОНЕЦ ОТЛАДКИ ===
+
+        df = df.dropna(subset=['datetime'])
+        df = df.sort_values('datetime').reset_index(drop=True)
+
+        print(f"✓ Загружено {len(df)} записей")
+        return df
+
+    except Exception as e:
+        print(f"✗ Ошибка: {e}")
+        import traceback
+        traceback.print_exc()
+        return pd.DataFrame()
+
+
+def get_aws_data_at_time(aws_df, target_datetime):
+    """
+    Возвращает метеоданные для конкретного времени
+    ИСПРАВЛЕНО: если нет точного совпадения — интерполируем
+    """
+    try:
+        # Ищем точное совпадение
+        mask = aws_df['datetime'] == target_datetime
+        if mask.any():
+            row = aws_df[mask].iloc[0]
+        else:
+            # Ищем ближайшие записи ДО и ПОСЛЕ
+            before = aws_df[aws_df['datetime'] <= target_datetime]
+            after = aws_df[aws_df['datetime'] >= target_datetime]
+
+            if len(before) > 0 and len(after) > 0:
+                row_before = before.iloc[-1]
+                row_after = after.iloc[0]
+
+                # Линейная интерполяция
+                t_before = row_before['datetime']
+                t_after = row_after['datetime']
+                t_target = target_datetime
+
+                if t_after != t_before:
+                    weight = (t_target - t_before).total_seconds() / (t_after - t_before).total_seconds()
+                else:
+                    weight = 0.5
+
+                # Интерполируем числовые поля
+                def interp(col):
+                    v1 = safe_float(row_before[col])
+                    v2 = safe_float(row_after[col])
+                    return v1 + (v2 - v1) * weight
+
+                aws_data = {
+                    'Sin_AWS2': interp('Sin_AWS2'),
+                    'Sout_AWS2': interp('Sout_AWS2'),
+                    'Lin_AWS2': interp('Lin_AWS2'),
+                    'T2m_AWS2': interp('T2m_AWS2'),
+                    'RH_AWS2': interp('RH_AWS2'),
+                    'wind_speed': interp('wind_speed'),
+                    'pressure': interp('pressure'),
+                    'precipitation': interp('precipitation'),
+                    'alpha_AWS2': interp('alpha_AWS2'),
+                }
+
+                if aws_data['alpha_AWS2'] > 0:
+                    aws_data['G_AWS2'] = aws_data['Sin_AWS2'] / aws_data['alpha_AWS2']
+                else:
+                    aws_data['G_AWS2'] = 0
+
+                return aws_data
+
+            elif len(before) > 0:
+                # Берём последнее значение перед target
+                row = before.iloc[-1]
+            elif len(after) > 0:
+                # Берём первое значение после target
+                row = after.iloc[0]
+            else:
+                # Вообще нет данных
+                return get_default_aws_data()
+
+        # Функция для безопасного преобразования
+        def safe_float(value, default=0.0):
+            try:
+                if pd.isna(value) or value == '' or value is None or value == 'NODATA':
+                    return default
+                return float(value)
+            except (ValueError, TypeError):
+                return default
+
+        aws_data = {
+            'Sin_AWS2': safe_float(row['Sin_AWS2']),
+            'Sout_AWS2': safe_float(row.get('Sout_AWS2', 0)),
+            'Lin_AWS2': safe_float(row['Lin_AWS2']),
+            'T2m_AWS2': safe_float(row['T2m_AWS2']),
+            'RH_AWS2': safe_float(row['RH_AWS2']),
+            'wind_speed': safe_float(row['wind_speed']),
+            'pressure': safe_float(row['pressure']),
+            'precipitation': safe_float(row['precipitation']),
+            'alpha_AWS2': safe_float(row['alpha_AWS2'], 0.5),
+        }
+
+        if aws_data['alpha_AWS2'] > 0 and aws_data['alpha_AWS2'] <= 1.0:
+            aws_data['G_AWS2'] = aws_data['Sin_AWS2'] / aws_data['alpha_AWS2']
+        else:
+            aws_data['G_AWS2'] = 0
+
+        return aws_data
+
+    except Exception as e:
+        print(f"Ошибка получения метеоданных для {target_datetime}: {e}")
+        return get_default_aws_data()
+
+
+def get_default_aws_data():
+    """Возвращает дефолтные метеоданные"""
+    return {
+        'Sin_AWS2': 0.0,
+        'Sout_AWS2': 0.0,
+        'Lin_AWS2': 300.0,
+        'T2m_AWS2': 5.0,
+        'RH_AWS2': 70.0,
+        'wind_speed': 2.0,
+        'pressure': 1013.0,
+        'precipitation': 0.0,
+        'alpha_AWS2': 0.5,
+        'G_AWS2': 0.0
+    }
+
+# ==================== ОСНОВНАЯ ФУНКЦИЯ С ИСПРАВЛЕННЫМ РАСЧЕТОМ ====================
+def run_glacier_model_final_correction(config=CONFIG):
+    sess = start_grass()
+    print("=" * 60)
+    print("ЗАПУСК МОДЕЛИ: 100 ТОЧЕК, ШАГ 30 МИН")
+    print("=" * 60)
+
+    ensure_dir(config["output_dir"])
+
+    # Загрузка данных
+    aws_df = load_real_aws_data()
+    if aws_df.empty:
+        print("Creating test AWS data...")
+        aws_df = create_test_aws_data()
+
+    # Точки
+    points_gdf = create_research_points(config["dem_tif"], config["glacier_shp"])
     if points_gdf.empty:
-        print("✗ Не удалось создать точки. Выход.")
-        return
+        raise Exception("Не удалось создать точки!")
 
-    # Словарь для хранения дневных переменных
-    daily_alpha = {}  # альбедо в полдень
-    daily_SD = {}  # снегопад
-    daily_Zsl = {}  # высота снеговой линии
-    daily_Ta_sum = {}  # сумма температур после снегопада
-    daily_days_since_snow = {}  # дней после снегопада
+    print(f"✓ Расчет будет выполнен для {len(points_gdf)} точек")
 
-    # Временной диапазон
-    start = pd.to_datetime(CONFIG["period_start"])
-    end = pd.to_datetime(CONFIG["period_end"])
-    time_step_seconds = CONFIG["time_step_minutes"] * 60
+    # Время
+    start = pd.to_datetime(config["period_start"])
+    end = pd.to_datetime(config["period_end"])
+    time_step_seconds = config["time_step_minutes"] * 60
 
-    # Список для результатов
     results = []
-
-    # Текущее время
     current_time = start
 
-    print("\n=== НАЧАЛО РАСЧЕТОВ ===")
+    # Отладка точки 94
+    debug_data_94 = []
 
+    print("\n=== НАЧАЛО РАСЧЕТА ПО ВРЕМЕНИ ===")
+
+    # === ГЛАВНЫЙ ЦИКЛ ПО ВРЕМЕНИ ===
     while current_time <= end:
         time_str = current_time.strftime("%Y-%m-%d %H:%M")
-        current_date = current_time.date()
+        # Округляем до 2 знаков, чтобы избежать 4.000000001
+        time_decimal = round(current_time.hour + current_time.minute / 60.0, 2)
 
-        # Получаем метеоданные для этого времени
-        aws_row = get_aws_at_time(aws_df, current_time)
+        # Получаем данные погоды один раз на этот момент времени
+        aws_data = get_aws_data_at_time(aws_df, current_time)
 
-        # --- ДНЕВНЫЕ РАСЧЕТЫ (выполняются один раз в день в 12:00) ---
-        if current_time.hour == 12 and current_time.minute == 0:
-            date_key = current_date
+        day_of_year = current_time.timetuple().tm_yday
+        time_decimal = current_time.hour + current_time.minute / 60
 
-            # Получаем альбедо в 12:00
-            alpha_12h = aws_row.get('alpha', 0.5)
-            daily_alpha[date_key] = alpha_12h
+        sess = start_grass()  # возвращает объект GRASS session
 
-            # Проверяем предыдущий день
-            prev_date = current_date - dt.timedelta(days=1)
-            if prev_date in daily_alpha:
-                alpha_prev = daily_alpha[prev_date]
-                alpha_diff = alpha_12h - alpha_prev
+        rad_map = run_rsun(sess, day_of_year, time_decimal)
 
-                # Определяем день со снегопадом (формула 2)
-                daily_SD[date_key] = 1 if alpha_diff >= CONFIG["alpha_d"] else 0
+        G_values = get_rsun_points(rad_map)
 
-                # Обновляем сумму температур после снегопада
-                if daily_SD[date_key] == 1:
-                    daily_days_since_snow[date_key] = 0
-                    daily_Ta_sum[date_key] = aws_row.get('T2m', 0)
-                else:
-                    if prev_date in daily_days_since_snow:
-                        daily_days_since_snow[date_key] = daily_days_since_snow[prev_date] + 1
-                        if prev_date in daily_Ta_sum:
-                            daily_Ta_sum[date_key] = daily_Ta_sum[prev_date] + aws_row.get('T2m', 0)
-                        else:
-                            daily_Ta_sum[date_key] = aws_row.get('T2m', 0)
-                    else:
-                        daily_days_since_snow[date_key] = 0
-                        daily_Ta_sum[date_key] = aws_row.get('T2m', 0)
-            else:
-                daily_SD[date_key] = 0
-                daily_days_since_snow[date_key] = 0
-                daily_Ta_sum[date_key] = aws_row.get('T2m', 0)
+        G_AWS2 = G_values.get(96, list(G_values.values())[0])
 
-            # Высота снеговой линии (формула 3)
-            day_of_year = current_time.timetuple().tm_yday
-            daily_Zsl[date_key] = CONFIG["asl"] * day_of_year + CONFIG["bsl"]
+        radiation_data = {}
 
-        # --- РАСЧЕТ r.sun ДЛЯ ВСЕХ ТОЧЕК ---
-        print(f"\n{time_str}: расчет r.sun...")
-        G_values = calculate_rsun_for_time(
-            gisdb, location, mapset, grass_bat,
-            points_gdf, current_time
-        )
+        for cat, val in G_values.items():
+            radiation_data[cat] = {
+                "G_cell": val,
+                "G_AWS2": G_AWS2,
+                "Sin_AWS2": aws_data['Sin_AWS2']
+            }
 
-        if not G_values:
-            print(f"  ⚠ Нет данных r.sun для {time_str}, пропускаем")
-            current_time += dt.timedelta(minutes=CONFIG["time_step_minutes"])
-            continue
+        print(f"  Обработка: {time_str} | Точек: {len(points_gdf)} | Погода T={aws_data.get('T2m_AWS2', '?'):.1f}")
 
-        # G для AWS2 (точка с минимальной высотой)
-        aws2_point = points_gdf.iloc[0]  # или найти по координатам
-        G_aws2 = G_values.get(aws2_point['cat'], 887.7)
-
-        # Sin AWS2 из метеоданных
-        Sin_aws2 = aws_row.get('Sin', 0)
-
-        print(f"  G_AWS2={G_aws2:.1f}, Sin_AWS2={Sin_aws2:.1f}")
-
-        # --- РАСЧЕТ ДЛЯ КАЖДОЙ ТОЧКИ ---
+        # === ВНУТРЕННИЙ ЦИКЛ ПО ТОЧКАМ ===
+        # Проходимся по КАЖДОЙ точке для ТЕКУЩЕГО времени
         for idx, point in points_gdf.iterrows():
             cat = point['cat']
             z = point['z']
 
-            if cat not in G_values:
+            if cat not in radiation_data:
                 continue
 
-            G_cell = G_values[cat]
+            # --- РАСЧЕТЫ ---
+            rad_info = radiation_data[cat]
+            G_cell = rad_info['G_cell']
+            G_AWS2_cell = rad_info['G_AWS2']
+            Sin_AWS2_excel = rad_info['Sin_AWS2']
 
-            # 1. Приходящая КВ-радиация (формула 1)
-            Sin_cell = compute_Sin_cell(Sin_aws2, G_cell, G_aws2)
+            # Sin Cell
+            Sin_cell = compute_Sin_cell_corrected(Sin_AWS2_excel, G_cell, G_AWS2_cell)
 
-            # 2. Температура воздуха (формула 11)
-            T2m_pt = compute_T2m_at_z(
-                aws_row.get('T2m', 0),
-                CONFIG["kt"],
-                z,
-                CONFIG["z_aws2"]
-            )
+            # Для отладки
+            if cat == 94:
+                debug_data_94.append({
+                    'datetime': current_time,
+                    'Sin_cell': Sin_cell,
+                    'G_cell': G_cell
+                })
 
-            # 3. Тип поверхности (формула 4)
-            date_key = current_date
-            SD = daily_SD.get(date_key, 0)
-            Zsl = daily_Zsl.get(date_key, 9999)
+            # Температура воздуха
+            T2m_pt = compute_T2m_at_z(aws_data['T2m_AWS2'], config["kt"], z, config["z_aws2"])
 
-            if SD == 1 or z >= Zsl:
-                ST = 1  # снег
-            else:
-                ST = 0  # лед
-
-            # 4. Сумма температур (формула 6)
-            nd_aws2 = daily_days_since_snow.get(date_key, 0)
-            Ta_aws2 = daily_Ta_sum.get(date_key, T2m_pt)
-            Ta_pt = Ta_aws2 + (nd_aws2 + 1) * CONFIG["kt"] * (z - CONFIG["z_aws2"])
-
-            # 5. Альбедо (формула 7)
-            alpha = compute_albedo(
-                ST, T2m_pt, Ta_pt,
-                CONFIG["kSS"], CONFIG["kT2m"], CONFIG["kTa"],
-                CONFIG["c_alpha"]
-            )
-
-            # 6. Отраженная радиация (формула 8)
+            # Альбедо и тип поверхности
+            ST = 1 if z > config["bsl"] else 0
+            Ta = 50
+            alpha = compute_albedo(ST, T2m_pt, Ta, config["kSS"], config["kT2m"], config["kTa"], config["c_alpha"])
             Sout = compute_Sout(alpha, Sin_cell)
 
-            # 7. Длинноволновая радиация атмосферы (формула 9)
-            Lin = aws_row.get('Lin', 300)
+            Lin = aws_data['Lin_AWS2']
 
-            # Первая итерация для Lout (без таяния)
-            Lout_temp, Ts_temp = compute_Lout(
-                CONFIG["epsilon"],
-                CONFIG["sigma"],
-                0,  # Qm=0 для первой итерации
-                ST
-            )
+            # Итерация 1
+            Lout_temp, Tsurface_temp = compute_Lout_corrected(config["epsilon"], config["sigma"], ST, 0)
+            H, LE = compute_turbulent_heat_corrected(T2m_pt, Tsurface_temp, aws_data['wind_speed'],
+                                                     aws_data['pressure'], aws_data['RH_AWS2'], z)
+            Qr = compute_rain_heat_corrected(T2m_pt, Tsurface_temp, aws_data['precipitation'])
+            Qg = compute_ground_heat_corrected(ST, Tsurface_temp, time_decimal)
+            Qm_temp = compute_melting_heat(Sin_cell, Sout, Lin, Lout_temp, H, LE, Qr, Qg)
 
-            # 8. Число Ричардсона (формула 16)
-            Rib = compute_richardson(
-                T2m_pt, Ts_temp,
-                aws_row.get('wind_speed', 2),
-                CONFIG["zm"], CONFIG["z0m"]
-            )
+            # Итерация 2 (уточнение Lout)
+            Lout, Tsurface = compute_Lout_corrected(config["epsilon"], config["sigma"], ST, Qm_temp)
+            Rnet, Snet, Lnet = compute_Rnet(Sin_cell, Sout, Lin, Lout)
 
-            # 9. Турбулентные потоки (формулы 18, 19)
-            H, LE = compute_turbulent_heat(
-                T2m_pt, Ts_temp,
-                aws_row.get('wind_speed', 2),
-                aws_row.get('pressure', 850),
-                aws_row.get('RH', 70),
-                Rib
-            )
+            # Финальные потоки
+            H, LE = compute_turbulent_heat_corrected(T2m_pt, Tsurface, aws_data['wind_speed'],
+                                                     aws_data['pressure'], aws_data['RH_AWS2'], z)
+            Qr = compute_rain_heat_corrected(T2m_pt, Tsurface, aws_data['precipitation'])
+            Qg = compute_ground_heat_corrected(ST, Tsurface, time_decimal)
+            Qm = compute_melting_heat(Sin_cell, Sout, Lin, Lout, H, LE, Qr, Qg)
 
-            # 10. Тепло от осадков (формула 20)
-            Qr = compute_rain_heat(
-                T2m_pt, Ts_temp,
-                aws_row.get('precipitation', 0)
-            )
+            ablation = compute_ablation_corrected(Qm, ST, time_step_seconds,
+                                                  config["rho_snow"], config["rho_ice"],
+                                                  config["L_fs"], config["L_fi"])
 
-            # 11. Теплообмен с ледником (формула 21)
-            Qg = compute_ground_heat(ST, Ts_temp)
-
-            # 12. Тепло на таяние (первая оценка)
-            Qm_temp = compute_melting_heat(
-                Sin_cell, Sout, Lin, Lout_temp,
-                H, LE, Qr, Qg
-            )
-
-            # 13. Финальный Lout с учетом таяния (формула 10)
-            Lout, Ts = compute_Lout(
-                CONFIG["epsilon"],
-                CONFIG["sigma"],
-                Qm_temp,
-                ST
-            )
-
-            # 14. Финальные потоки
-            H, LE = compute_turbulent_heat(
-                T2m_pt, Ts,
-                aws_row.get('wind_speed', 2),
-                aws_row.get('pressure', 850),
-                aws_row.get('RH', 70),
-                Rib
-            )
-
-            Qg = compute_ground_heat(ST, Ts)
-
-            Qm = compute_melting_heat(
-                Sin_cell, Sout, Lin, Lout,
-                H, LE, Qr, Qg
-            )
-
-            # 15. Абляция (формула 23)
-            ablation = compute_ablation(
-                Qm, ST, time_step_seconds,
-                CONFIG["L_fs"], CONFIG["L_fi"]
-            )
-
-            # Радиационный баланс
-            Snet = Sin_cell - Sout
-            Lnet = Lin - Lout
-            Rnet = Snet + Lnet
-
-            # Сохраняем результат
+            # Сохраняем строку результата
             results.append({
                 'datetime': current_time,
-                'date': current_time.date(),
-                'time': current_time.time(),
+                'time_str': time_str,
                 'cat': cat,
                 'z': z,
-                'G_rsun': G_cell,
-                'Sin': Sin_cell,
-                'alpha': alpha,
+                'r_sun_global_rad': G_cell,
+                'Sin_cell': Sin_cell,
                 'Sout': Sout,
-                'Snet': Snet,
                 'Lin': Lin,
                 'Lout': Lout,
-                'Lnet': Lnet,
-                'Rnet': Rnet,
                 'T2m': T2m_pt,
-                'Ts': Ts,
+                'Ts': Tsurface,
                 'H': H,
                 'LE': LE,
-                'Qt': Qr,
+                'Qr': Qr,
                 'Qg': Qg,
                 'Qm': Qm,
-                'ablation_mm': ablation,
-                'ST': ST,
-                'Rib': Rib if Rib is not None else 0
+                'ablation_mm': ablation
             })
 
-        # Переходим к следующему шагу
-        current_time += dt.timedelta(minutes=CONFIG["time_step_minutes"])
+        # === ВАЖНО: ПЕРЕКЛЮЧЕНИЕ ВРЕМЕНИ НАХОДИТСЯ ЗДЕСЬ ===
+        # Оно вне цикла `for point`, но внутри цикла `while current_time`
+        current_time += dt.timedelta(minutes=config["time_step_minutes"])
 
-    # --- СОХРАНЕНИЕ РЕЗУЛЬТАТОВ ---
-    print("\n=== СОХРАНЕНИЕ РЕЗУЛЬТАТОВ ===")
-
-    if not results:
-        print("✗ Нет результатов для сохранения")
-        return
-
+    # --- СОХРАНЕНИЕ ---
+    print("\n=== СОХРАНЕНИЕ ===")
     results_df = pd.DataFrame(results)
 
-    # Сохраняем в CSV
-    csv_file = Path(CONFIG["output_dir"]) / "model_results_complete.csv"
-    results_df.to_csv(csv_file, index=False)
-    print(f"✓ CSV сохранен: {csv_file}")
-    print(f"  Строк: {len(results_df)}")
-    print(f"  Уникальных точек: {results_df['cat'].nunique()}")
-    print(f"  Временных шагов: {results_df['datetime'].nunique()}")
+    if results_df.empty:
+        print("⚠ ОШИБКА: Результаты пусты!")
+    else:
+        out_file = Path(config["output_dir"]) / "model_results_full.csv"
+        results_df.to_csv(out_file, index=False)
+        print(f"✓ Сохранено строк: {len(results_df)}")
+        print(f"✓ Файл: {out_file}")
 
-    # Создаем сводку по точкам
-    pivot_file = Path(CONFIG["output_dir"]) / "points_summary.csv"
-    points_summary = results_df.groupby('cat').agg({
-        'z': 'first',
-        'ablation_mm': 'sum',
-        'Qm': 'mean',
-        'Sin': 'mean'
-    }).round(2)
-    points_summary.to_csv(pivot_file)
-    print(f"✓ Сводка по точкам: {pivot_file}")
+        # Проверка размера (должно быть: кол-во шагов * кол-во точек)
+        expected_rows = len(points_gdf) * len(pd.date_range(start, end, freq=f'{config["time_step_minutes"]}min'))
+        print(f"✓ Ожидалось строк примерно: {expected_rows}")
 
-    # Сохраняем пример данных для верификации
-    sample = results_df[results_df['cat'] == 1].head(48)
-    sample_file = Path(CONFIG["output_dir"]) / "sample_point_1.csv"
-    sample.to_csv(sample_file, index=False)
-
-    print("\n=== МОДЕЛЬ ЗАВЕРШЕНА ===")
-
-    # Очистка временной GRASS директории
-    try:
-        import shutil
-        shutil.rmtree(gisdb)
-        print(f"✓ Временная GRASS директория удалена: {gisdb}")
-    except:
-        print(f"⚠ Не удалось удалить {gisdb}")
+    print("ГОТОВО.")
 
 
+def create_test_aws_data():
+    """Создает тестовые метеоданные на основе Excel шаблона"""
+    start_date = pd.to_datetime(CONFIG["period_start"])
+    dates = [start_date + pd.Timedelta(minutes=30 * i) for i in range(48)]
+
+    # Значения Sin_AWS2 из Excel
+    sin_values = [
+        0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,  # 00:00 - 03:30
+        8.5, 20.3, 76.1, 231.9, 170.8, 143.6, 138.6, 113.1,  # 04:00 - 07:30
+        190.4, 270.7, 350.4, 421.8, 506.2, 632.2, 655.0, 760.4,  # 08:00 - 11:30
+        776.2, 870.1, 308.7, 654.6, 267.0, 267.7, 229.1, 265.9,  # 12:00 - 15:30
+        418.2, 312.4, 251.8, 12.3, 94.7, 67.6, 45.7, 32.2,  # 16:00 - 19:30
+        23.7, 6.8, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0  # 20:00 - 23:30
+    ]
+
+    data = []
+    for i, date in enumerate(dates):
+        sin_val = sin_values[i] if i < len(sin_values) else 0.0
+
+        # Рассчитываем температуру на основе времени суток
+        hour = date.hour
+        if 6 <= hour <= 18:  # день
+            temp = 8 + 4 * np.sin((hour - 6) * np.pi / 12)
+        else:  # ночь
+            temp = 2 + 2 * np.sin((hour + 6) * np.pi / 12)
+
+        data.append({
+            'datetime': date,
+            'Sin_AWS2': sin_val,
+            'T2m_AWS2': temp,
+            'RH_AWS2': 70 - 10 * np.sin(hour * np.pi / 12),
+            'wind_speed': 2.0 + 1.0 * np.sin(hour * np.pi / 12),
+            'pressure': 1013,
+            'precipitation': 0.0,
+            'alpha_AWS2': 0.5,
+            'Lin_AWS2': 300 + 50 * np.sin(hour * np.pi / 12)
+        })
+
+    df = pd.DataFrame(data)
+    df['G_AWS2'] = df['Sin_AWS2'] / df['alpha_AWS2']
+    return df
+
+
+# ==================== ЗАПУСК ИСПРАВЛЕННОЙ ПРОГРАММЫ ====================
 if __name__ == "__main__":
-    run_glacier_model()
+    run_glacier_model_final_correction()

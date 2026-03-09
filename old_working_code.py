@@ -47,8 +47,8 @@ CONFIG = {
     "glacier_shp": "glacier.shp",
     "output_dir": "output_model",
     "time_step_minutes": 30,
-    "period_start": "2019-07-07T00:00:00",
-    "period_end": "2019-08-31T23:30:00",
+    "period_start": "2019-07-07T00:00:00", # по умолчанию - 2019-07-07T00:00:00
+    "period_end": "2019-08-31T23:30:00", # по умолчанию - 2019-08-31T23:30:00
     "kt": -0.0065,
     "asl": 1.7813, "bsl": 2067.6,
     "kSS": 0.33745, "kT2m": 0.00838, "kTa": -0.00112, "c_alpha": 0.13469,
@@ -343,6 +343,8 @@ def calculate_solar_radiation_with_excel_pattern(points_gdf, datetime_obj, aws_d
             22.0: 0.0, 22.5: 0.0, 23.0: 0.0, 23.5: 0.0
         }
 
+
+
         # Интерполяция G_cell (точка 94 — эталон)
         hours_94 = sorted(excel_g_values_94.keys())
         vals_94 = [excel_g_values_94[h] for h in hours_94]
@@ -355,6 +357,23 @@ def calculate_solar_radiation_with_excel_pattern(points_gdf, datetime_obj, aws_d
 
         # Реальное Sin_AWS2 из метеоданных (меняется каждый день!)
         sin_aws2 = aws_data['Sin_AWS2']
+
+        # === ОТЛАДКА: ВСТАВИТЬ СЮДА ===
+        if not hasattr(calculate_solar_radiation_with_excel_pattern, '_debug_count'):
+            calculate_solar_radiation_with_excel_pattern._debug_count = 0
+
+        if calculate_solar_radiation_with_excel_pattern._debug_count < 48:
+            ratio = g_cell_base / g_aws2 if g_aws2 > 0.1 else 0
+            sin_cell_calc = sin_aws2 * ratio if g_aws2 > 0.1 else 0
+
+            print(f"  DEBUG {datetime_obj.strftime('%H:%M')}: "
+                  f"Sin_AWS2={sin_aws2:.1f}, "
+                  f"G_cell={g_cell_base:.1f}, G_AWS2={g_aws2:.1f}, "
+                  f"ratio={ratio:.4f}, "
+                  f"Sin_cell={sin_cell_calc:.1f}")
+
+            calculate_solar_radiation_with_excel_pattern._debug_count += 1
+        # === КОНЕЦ ОТЛАДКИ ===
 
         radiation_values = {}
 
@@ -370,6 +389,8 @@ def calculate_solar_radiation_with_excel_pattern(points_gdf, datetime_obj, aws_d
                 'G_AWS2': g_aws2,  # ← ФИКС: реальное значение r.sun для AWS2
                 'Sin_AWS2': sin_aws2  # ← ФИКС: реальное значение из метеоданных
             }
+
+
 
         return radiation_values
 
@@ -749,14 +770,11 @@ def load_real_aws_data(excel_file="test_model.xlsx", sheet_name="AWS2_30min"):
     try:
         print(f"Загружаем реальные метеоданные из {excel_file}...")
 
-        # Читаем Excel, пропускаем первые 2 строки (заголовки)
         df = pd.read_excel(excel_file, sheet_name=sheet_name, header=2)
 
-        # Переименовываем столбцы для удобства
+        print(f"Столбцы ДО переименования: {df.columns.tolist()}")
+
         column_mapping = {
-            'X': 'x_aws2',
-            'Y': 'y_aws2',
-            'Z': 'z_aws2',
             'Sin': 'Sin_AWS2',
             'Sout': 'Sout_AWS2',
             'Lin': 'Lin_AWS2',
@@ -770,39 +788,115 @@ def load_real_aws_data(excel_file="test_model.xlsx", sheet_name="AWS2_30min"):
 
         df = df.rename(columns=column_mapping)
 
-        # Добавляем столбец datetime (предполагаем, что данные идут с шагом 30 мин с начала периода)
-        start_date = pd.to_datetime(CONFIG["period_start"])
-        df['datetime'] = [start_date + pd.Timedelta(minutes=30 * i) for i in range(len(df))]
+        # === ОТЛАДКА: показываем данные для 7 июля ===
+        if 'Дата&Время' in df.columns:
+            df['datetime'] = pd.to_datetime(df['Дата&Время'])
 
-        print(f"✓ Загружено {len(df)} записей метеоданных")
-        print("Доступные столбцы:", df.columns.tolist())
+        # Фильтруем 7 июля
+        july7 = df[df['datetime'].dt.date == pd.to_datetime('2019-07-07').date()]
 
+        print(f"\n=== ДАННЫЕ ЗА 7 ИЮЛЯ ===")
+        print(f"Найдено записей: {len(july7)}")
+
+        if len(july7) > 0:
+            print(f"\nПервые 10 записей 7 июля:")
+            for i, (idx, row) in enumerate(july7.head(10).iterrows()):
+                time_str = row['datetime'].strftime('%H:%M')
+                sin_val = row['Sin_AWS2']
+                print(f"  {time_str}: Sin_AWS2 = {sin_val}")
+
+            # Проверяем полдень
+            noon = july7[july7['datetime'].dt.hour == 12]
+            print(f"\nДанные в 12:00-12:30:")
+            for idx, row in noon.iterrows():
+                time_str = row['datetime'].strftime('%H:%M')
+                sin_val = row['Sin_AWS2']
+                print(f"  {time_str}: Sin_AWS2 = {sin_val}")
+
+        print(f"=== КОНЕЦ ОТЛАДКИ ===\n")
+        # === КОНЕЦ ОТЛАДКИ ===
+
+        df = df.dropna(subset=['datetime'])
+        df = df.sort_values('datetime').reset_index(drop=True)
+
+        print(f"✓ Загружено {len(df)} записей")
         return df
 
     except Exception as e:
-        print(f"✗ Ошибка загрузки метеоданных: {e}")
+        print(f"✗ Ошибка: {e}")
+        import traceback
+        traceback.print_exc()
         return pd.DataFrame()
 
 
 def get_aws_data_at_time(aws_df, target_datetime):
     """
-    Возвращает метеоданные для конкретного времени с проверкой типов данных
+    Возвращает метеоданные для конкретного времени
+    ИСПРАВЛЕНО: если нет точного совпадения — интерполируем
     """
     try:
-        # Находим точное совпадение по времени
+        # Ищем точное совпадение
         mask = aws_df['datetime'] == target_datetime
         if mask.any():
             row = aws_df[mask].iloc[0]
         else:
-            # Или ближайшую запись
-            time_diff = abs(aws_df['datetime'] - target_datetime)
-            closest_idx = time_diff.idxmin()
-            row = aws_df.loc[closest_idx]
+            # Ищем ближайшие записи ДО и ПОСЛЕ
+            before = aws_df[aws_df['datetime'] <= target_datetime]
+            after = aws_df[aws_df['datetime'] >= target_datetime]
 
-        # Функция для безопасного преобразования в float
+            if len(before) > 0 and len(after) > 0:
+                row_before = before.iloc[-1]
+                row_after = after.iloc[0]
+
+                # Линейная интерполяция
+                t_before = row_before['datetime']
+                t_after = row_after['datetime']
+                t_target = target_datetime
+
+                if t_after != t_before:
+                    weight = (t_target - t_before).total_seconds() / (t_after - t_before).total_seconds()
+                else:
+                    weight = 0.5
+
+                # Интерполируем числовые поля
+                def interp(col):
+                    v1 = safe_float(row_before[col])
+                    v2 = safe_float(row_after[col])
+                    return v1 + (v2 - v1) * weight
+
+                aws_data = {
+                    'Sin_AWS2': interp('Sin_AWS2'),
+                    'Sout_AWS2': interp('Sout_AWS2'),
+                    'Lin_AWS2': interp('Lin_AWS2'),
+                    'T2m_AWS2': interp('T2m_AWS2'),
+                    'RH_AWS2': interp('RH_AWS2'),
+                    'wind_speed': interp('wind_speed'),
+                    'pressure': interp('pressure'),
+                    'precipitation': interp('precipitation'),
+                    'alpha_AWS2': interp('alpha_AWS2'),
+                }
+
+                if aws_data['alpha_AWS2'] > 0:
+                    aws_data['G_AWS2'] = aws_data['Sin_AWS2'] / aws_data['alpha_AWS2']
+                else:
+                    aws_data['G_AWS2'] = 0
+
+                return aws_data
+
+            elif len(before) > 0:
+                # Берём последнее значение перед target
+                row = before.iloc[-1]
+            elif len(after) > 0:
+                # Берём первое значение после target
+                row = after.iloc[0]
+            else:
+                # Вообще нет данных
+                return get_default_aws_data()
+
+        # Функция для безопасного преобразования
         def safe_float(value, default=0.0):
             try:
-                if pd.isna(value) or value == '' or value is None:
+                if pd.isna(value) or value == '' or value is None or value == 'NODATA':
                     return default
                 return float(value)
             except (ValueError, TypeError):
@@ -817,41 +911,35 @@ def get_aws_data_at_time(aws_df, target_datetime):
             'wind_speed': safe_float(row['wind_speed']),
             'pressure': safe_float(row['pressure']),
             'precipitation': safe_float(row['precipitation']),
-            'alpha_AWS2': safe_float(row['alpha_AWS2']),
+            'alpha_AWS2': safe_float(row['alpha_AWS2'], 0.5),
         }
 
-        # Значения из Excel для калибровки
-        # В Excel обычно G рассчитывается как Sin/alpha
         if aws_data['alpha_AWS2'] > 0 and aws_data['alpha_AWS2'] <= 1.0:
             aws_data['G_AWS2'] = aws_data['Sin_AWS2'] / aws_data['alpha_AWS2']
         else:
-            aws_data['G_AWS2'] = 887.7  # Значение по умолчанию из примера
-
-            # Масштабируем Sin по времени суток
-            hour = target_datetime.hour
-            if 4 <= hour <= 20:
-                aws_data['G_AWS2'] = aws_data['Sin_AWS2'] * 1.5  # Приблизительное соотношение
-            else:
-                aws_data['G_AWS2'] = 0.0
+            aws_data['G_AWS2'] = 0
 
         return aws_data
 
     except Exception as e:
-        print(f"Ошибка получения метеоданных для времени {target_datetime}: {e}")
-        # Возвращаем данные по умолчанию в случае ошибки
-        return {
-            'Sin_AWS2': 0.0,
-            'Sout_AWS2': 0.0,
-            'Lin_AWS2': 300.0,
-            'T2m_AWS2': 5.0,
-            'RH_AWS2': 70.0,
-            'wind_speed': 2.0,
-            'pressure': 1013.0,
-            'precipitation': 0.0,
-            'alpha_AWS2': 0.5,
-            'G_AWS2': 887.7
-        }
+        print(f"Ошибка получения метеоданных для {target_datetime}: {e}")
+        return get_default_aws_data()
 
+
+def get_default_aws_data():
+    """Возвращает дефолтные метеоданные"""
+    return {
+        'Sin_AWS2': 0.0,
+        'Sout_AWS2': 0.0,
+        'Lin_AWS2': 300.0,
+        'T2m_AWS2': 5.0,
+        'RH_AWS2': 70.0,
+        'wind_speed': 2.0,
+        'pressure': 1013.0,
+        'precipitation': 0.0,
+        'alpha_AWS2': 0.5,
+        'G_AWS2': 0.0
+    }
 
 # ==================== ОСНОВНАЯ ФУНКЦИЯ С ИСПРАВЛЕННЫМ РАСЧЕТОМ ====================
 def run_glacier_model_final_correction(config=CONFIG):
