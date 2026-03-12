@@ -14,17 +14,110 @@ import geopandas as gpd
 import rasterio
 from rasterio.crs import CRS
 
+# ===== НАСТРОЙКА GRASS GIS =====
+grass_base = r"C:\GRASS"
 
-os.environ["GRASSBIN"] = r"C:\Users\skibc\GRASSG~1.8\grass78.bat"
-GRASS_DB = r"C:\Users\skibc\OneDrive\Документы\grassdata"
+# 1. Проверяем, что GRASS существует
+if not os.path.exists(grass_base):
+    print(f"✗ GRASS не найден в {grass_base}")
+    sys.exit(1)
+
+# 2. Устанавливаем GISBASE (КРИТИЧЕСКИ ВАЖНО - ДО импорта!)
+os.environ['GISBASE'] = grass_base
+
+# 3. Добавляем пути в PATH
+grass_bin = os.path.join(grass_base, "bin")
+grass_lib = os.path.join(grass_base, "lib")
+grass_scripts = os.path.join(grass_base, "scripts")
+
+os.environ['PATH'] = ";".join([
+    grass_bin,
+    grass_lib,
+    grass_scripts,
+    os.environ.get('PATH', '')
+])
+
+# 4. Добавляем Python-пути (INSERT в начало, не append!)
+grass_python_paths = [
+    os.path.join(grass_base, "etc", "python"),
+    os.path.join(grass_base, "gui", "wxpython"),
+]
+
+for p in grass_python_paths:
+    if os.path.exists(p) and p not in sys.path:
+        sys.path.insert(0, p)  # INSERT(0) - в НАЧАЛО списка!
+
+# 5. Устанавливаем PYTHONPATH
+grass_pythonpath = os.path.join(grass_base, "etc", "python")
+existing_pythonpath = os.environ.get('PYTHONPATH', '')
+os.environ['PYTHONPATH'] = grass_pythonpath + ";" + existing_pythonpath
+
+# 6. Дополнительные переменные GRASS
+os.environ['GRASSBIN'] = os.path.join(grass_base, "grass78.bat")
+os.environ['GRASS_PYTHON'] = sys.executable
+os.environ['GRASS_SH'] = os.path.join(grass_base, "msys", "bin", "sh.exe")
+
+# 7. Диагностика перед импортом
+print("=== Диагностика GRASS ===")
+print(f"GISBASE: {os.environ.get('GISBASE')}")
+etc_python = os.path.join(grass_base, "etc", "python")
+print(f"etc/python exists: {os.path.exists(etc_python)}")
+
+grass_pkg = os.path.join(etc_python, "grass")
+print(f"grass/ exists: {os.path.exists(grass_pkg)}")
+
+script_pkg = os.path.join(grass_pkg, "script")
+print(f"grass/script/ exists: {os.path.exists(script_pkg)}")
+
+init_file = os.path.join(script_pkg, "__init__.py")
+print(f"__init__.py exists: {os.path.exists(init_file)}")
+
+if os.path.exists(grass_pkg):
+    print(f"grass/ содержит: {os.listdir(grass_pkg)[:10]}")
+
+print(f"\nsys.path (первые 5):")
+for p in sys.path[:5]:
+    print(f"  {p}")
+
+# 8. Импорт GRASS модулей
+try:
+    import grass.script as gs
+    import grass.script.setup as gsetup
+    print("\n✓ grass.script импортирован")
+except ImportError as e:
+    print(f"\n✗ Ошибка импорта grass.script: {e}")
+    print("\nПолный sys.path:")
+    for p in sys.path:
+        print(f"  {p}")
+    sys.exit(1)
+
+# 9. Импорт grass_session (опционально, если установлен)
+try:
+    from grass_session import Session
+    print("✓ grass_session импортирован")
+    USE_GRASS_SESSION = True
+except ImportError:
+    print("⚠ grass_session не установлен, используем альтернативный метод")
+    USE_GRASS_SESSION = False
+
+# ===== ПУТИ К ДАННЫМ =====
+# ВАЖНО: убраны лишние кавычки!
+GRASS_DB = r"C:\GRASS\grassdata"  # БЕЗ кавычек внутри строки!
 LOCATION = "glacier"
 MAPSET = "PERMANENT"
 
-from grass_session import Session
-import grass.script as gs
+# Проверяем существование базы данных
+if not os.path.exists(GRASS_DB):
+    print(f"⚠ GRASS database не найдена: {GRASS_DB}")
+    print("  Будет создана при первом запуске")
+    os.makedirs(GRASS_DB, exist_ok=True)
 
+print(f"\n✓ GRASS_DB: {GRASS_DB}")
+print(f"✓ LOCATION: {LOCATION}")
+print(f"✓ MAPSET: {MAPSET}")
 def start_grass():
 
+    # запускаем session
     sess = Session()
     sess.open(
         gisdb=GRASS_DB,
@@ -33,13 +126,13 @@ def start_grass():
     )
 
     print("✓ GRASS session started")
-
+    print(gs.read_command("g.version"))
     return sess
 
 def run_rsun(session, day_of_year, time_decimal):
     import grass.script as gs
 
-    rad_map = 'rad_map'  # имя выходной карты
+    rad_map = f"rad_{day_of_year}_{int(time_decimal*10)}"  # имя выходной карты
     gs.run_command(
         'r.sun',
         elevation='DEM',
@@ -87,7 +180,7 @@ CONFIG = {
     "output_dir": "output_model",
     "time_step_minutes": 30,
     "period_start": "2019-07-07T00:00:00", # по умолчанию - 2019-07-07T00:00:00
-    "period_end": "2019-08-31T23:30:00", # по умолчанию - 2019-08-31T23:30:00
+    "period_end": "2019-07-08T23:30:00", # по умолчанию - 2019-08-31T23:30:00
     "kt": -0.0065,
     "asl": 1.7813, "bsl": 2067.6,
     "kSS": 0.33745, "kT2m": 0.00838, "kTa": -0.00112, "c_alpha": 0.13469,
@@ -183,7 +276,7 @@ def setup_grass_simple():
     print(f"GRASS database: {gisdb}")
 
     try:
-        grass_bat = r"C:\Users\skibc\GRASS_GIS_7.8\grass78.bat"
+        grass_bat = r"C:\GRASS\grass78.bat"
 
         # Создаем location
         cmd = [grass_bat, "-c", "EPSG:4326", "-e", os.path.join(gisdb, location_name)]
@@ -243,7 +336,7 @@ def run_r_sun_grass(gisdb, location_name, day_of_year, time_decimal, points_coun
     """
     Запускает r.sun через GRASS и возвращает значения радиации
     """
-    grass_bat = r"C:\Users\skibc\GRASS GIS 7.8\grass78.bat"
+    grass_bat = r"C:\GRASS\grass78.bat"
 
     rad_name = f"radiation_{day_of_year}_{int(time_decimal * 100)}"
 
@@ -693,7 +786,7 @@ def create_research_points(dem_tif, glacier_shp, num_points=100):
 
 
 # ==================== ЗАГРУЗКА РЕАЛЬНЫХ МЕТЕОДАННЫХ ====================
-def load_real_aws_data(excel_file="test_model.xlsx", sheet_name="AWS2_30min"):
+def load_real_aws_data(excel_file="Test_model.xlsx", sheet_name="AWS2_30min"):
     """
     Загружает реальные метеоданные из Excel файла
     """
@@ -873,172 +966,194 @@ def get_default_aws_data():
 
 # ==================== ОСНОВНАЯ ФУНКЦИЯ С ИСПРАВЛЕННЫМ РАСЧЕТОМ ====================
 def run_glacier_model_final_correction(config=CONFIG):
-    sess = start_grass()
     print("=" * 60)
     print("ЗАПУСК МОДЕЛИ: 100 ТОЧЕК, ШАГ 30 МИН")
     print("=" * 60)
 
     ensure_dir(config["output_dir"])
 
-    # Загрузка данных
+    # Загрузка метеоданных
     aws_df = load_real_aws_data()
     if aws_df.empty:
-        print("Creating test AWS data...")
+        print("Создаём тестовые метеоданные...")
         aws_df = create_test_aws_data()
 
-    # Точки
+    # Создание точек исследования (вне GRASS)
     points_gdf = create_research_points(config["dem_tif"], config["glacier_shp"])
     if points_gdf.empty:
         raise Exception("Не удалось создать точки!")
+    print(f"✓ Создано точек: {len(points_gdf)}")
 
-    print(f"✓ Расчет будет выполнен для {len(points_gdf)} точек")
-
-    # Время
+    # Временные параметры
     start = pd.to_datetime(config["period_start"])
     end = pd.to_datetime(config["period_end"])
     time_step_seconds = config["time_step_minutes"] * 60
+    all_times = pd.date_range(start, end, freq=f'{config["time_step_minutes"]}min')
 
+    # Хранилище результатов
     results = []
-    current_time = start
 
-    # Отладка точки 94
-    debug_data_94 = []
+    # === ОДИН КОНТЕКСТ GRASS НА ВЕСЬ РАСЧЁТ ===
+    with Session(gisdb=GRASS_DB, location=LOCATION, mapset=MAPSET, grassbin=os.environ["GRASSBIN"]) as sess:
+        print("✓ GRASS session started")
 
-    print("\n=== НАЧАЛО РАСЧЕТА ПО ВРЕМЕНИ ===")
+        # --- 1. Импорт/проверка необходимых данных в GRASS ---
+        gs.run_command('g.region', raster='DEM')
 
-    # === ГЛАВНЫЙ ЦИКЛ ПО ВРЕМЕНИ ===
-    while current_time <= end:
-        time_str = current_time.strftime("%Y-%m-%d %H:%M")
-        # Округляем до 2 знаков, чтобы избежать 4.000000001
-        time_decimal = round(current_time.hour + current_time.minute / 60.0, 2)
+        # Проверим наличие slope/aspect, если нет – вычислим
+        if not gs.find_file('slope', element='cell')['file'] or not gs.find_file('aspect', element='cell')['file']:
+            print("Вычисляем slope и aspect...")
+            gs.run_command('r.slope.aspect', elevation='DEM', slope='slope', aspect='aspect', overwrite=True)
 
-        # Получаем данные погоды один раз на этот момент времени
-        aws_data = get_aws_data_at_time(aws_df, current_time)
+        # Устанавливаем регион по DEM
+        gs.run_command('g.region', raster='DEM')
 
-        day_of_year = current_time.timetuple().tm_yday
-        time_decimal = current_time.hour + current_time.minute / 60
+        # Импортируем вектор ледника для маски (если нужно)
+        if not gs.find_file('glacier', element='vector')['file']:
+            print("Импортируем границу ледника...")
+            gs.run_command('v.in.ogr', input=config['glacier_shp'], output='glacier', overwrite=True)
 
-        sess = start_grass()  # возвращает объект GRASS session
+        # Создаём маску по леднику (опционально, если нужно ограничить расчёт)
+        # gs.run_command('r.mask', vector='glacier', overwrite=True)
 
-        rad_map = run_rsun(sess, day_of_year, time_decimal)
+        # --- 2. Импорт точек исследования ---
+        # Сохраняем points_gdf во временный shapefile и импортируем в GRASS
+        tmp_shp = os.path.join(tempfile.gettempdir(), "research_points.shp")
+        points_gdf.to_file(tmp_shp)
+        gs.run_command('v.in.ogr', input=tmp_shp, output='points', overwrite=True, flags='o')
+        # Добавляем колонку для радиации, если её нет
+        gs.run_command('v.db.addcolumn', map='points', columns='G double precision')
+        print("✓ Точки импортированы в GRASS")
 
-        G_values = get_rsun_points(rad_map)
+        # --- 3. Главный цикл по времени ---
+        for current_time in all_times:
+            time_str = current_time.strftime("%Y-%m-%d %H:%M")
+            day_of_year = current_time.timetuple().tm_yday
+            time_decimal = current_time.hour + current_time.minute / 60.0
 
-        G_AWS2 = G_values.get(96, list(G_values.values())[0])
+            # Получаем метеоданные для этого момента
+            aws_data = get_aws_data_at_time(aws_df, current_time)
 
-        radiation_data = {}
+            # Имя для карты радиации
+            rad_map = f"rad_{day_of_year}_{int(time_decimal*100)}"
 
-        for cat, val in G_values.items():
-            radiation_data[cat] = {
-                "G_cell": val,
-                "G_AWS2": G_AWS2,
-                "Sin_AWS2": aws_data['Sin_AWS2']
-            }
+            # Запускаем r.sun
+            gs.run_command(
+                'r.sun',
+                elevation='DEM',
+                slope='slope',
+                aspect='aspect',
+                day=day_of_year,
+                time=time_decimal,
+                glob_rad=rad_map,
+                overwrite=True
+            )
 
-        print(f"  Обработка: {time_str} | Точек: {len(points_gdf)} | Погода T={aws_data.get('T2m_AWS2', '?'):.1f}")
+            # Извлекаем значения в точках
+            gs.run_command('v.what.rast', map='points', raster=rad_map, column='G')
 
-        # === ВНУТРЕННИЙ ЦИКЛ ПО ТОЧКАМ ===
-        # Проходимся по КАЖДОЙ точке для ТЕКУЩЕГО времени
-        for idx, point in points_gdf.iterrows():
-            cat = point['cat']
-            z = point['z']
+            # Читаем таблицу с результатами
+            table = gs.read_command('v.db.select', map='points', columns='cat,G')
+            G_values = {}
+            for line in table.strip().split('\n')[1:]:
+                if '|' in line:
+                    parts = line.split('|')
+                    if len(parts) >= 2:
+                        try:
+                            cat = int(parts[0])
+                            val = float(parts[1])
+                            G_values[cat] = val
+                        except:
+                            pass
 
-            if cat not in radiation_data:
+            if not G_values:
+                print(f"  ⚠ Нет данных радиации для {time_str}, пропускаем")
                 continue
 
-            # --- РАСЧЕТЫ ---
-            rad_info = radiation_data[cat]
-            G_cell = rad_info['G_cell']
-            G_AWS2_cell = rad_info['G_AWS2']
-            Sin_AWS2_excel = rad_info['Sin_AWS2']
+            # Значение в опорной точке AWS2 (cat=96 или первое попавшееся)
+            G_AWS2 = G_values.get(96, list(G_values.values())[0])
 
-            # Sin Cell
-            Sin_cell = compute_Sin_cell_corrected(Sin_AWS2_excel, G_cell, G_AWS2_cell)
+            print(f"  {time_str} | точек с данными: {len(G_values)} | T2m={aws_data.get('T2m_AWS2', 0):.1f}")
 
-            # Для отладки
-            if cat == 94:
-                debug_data_94.append({
+            # --- 4. Расчёт для каждой точки ---
+            for idx, point in points_gdf.iterrows():
+                cat = point['cat']
+                z = point['z']
+                G_cell = G_values.get(cat, 0)
+
+                # Пропускаем точки без радиации (обычно не бывает)
+                if G_cell <= 0:
+                    continue
+
+                # Основные вычисления (полностью скопированы из вашего кода)
+                Sin_cell = compute_Sin_cell_corrected(aws_data['Sin_AWS2'], G_cell, G_AWS2)
+                T2m_pt = compute_T2m_at_z(aws_data['T2m_AWS2'], config["kt"], z, config["z_aws2"])
+                ST = 1 if z > config["bsl"] else 0
+                Ta = 50
+                alpha = compute_albedo(ST, T2m_pt, Ta,
+                                       config["kSS"], config["kT2m"], config["kTa"], config["c_alpha"])
+                Sout = compute_Sout(alpha, Sin_cell)
+                Lin = aws_data['Lin_AWS2']
+
+                # Первая итерация (Qm=0 для Lout)
+                Lout_temp, Tsurface_temp = compute_Lout_corrected(config["epsilon"], config["sigma"], ST, 0)
+                H, LE = compute_turbulent_heat_corrected(T2m_pt, Tsurface_temp, aws_data['wind_speed'],
+                                                          aws_data['pressure'], aws_data['RH_AWS2'], z)
+                Qr = compute_rain_heat_corrected(T2m_pt, Tsurface_temp, aws_data['precipitation'])
+                Qg = compute_ground_heat_corrected(ST, Tsurface_temp, time_decimal)
+                Qm_temp = compute_melting_heat(Sin_cell, Sout, Lin, Lout_temp, H, LE, Qr, Qg)
+
+                # Вторая итерация с уточнённым Lout
+                Lout, Tsurface = compute_Lout_corrected(config["epsilon"], config["sigma"], ST, Qm_temp)
+                Rnet, Snet, Lnet = compute_Rnet(Sin_cell, Sout, Lin, Lout)
+
+                # Пересчёт турбулентных потоков с новой Ts
+                H, LE = compute_turbulent_heat_corrected(T2m_pt, Tsurface, aws_data['wind_speed'],
+                                                          aws_data['pressure'], aws_data['RH_AWS2'], z)
+                Qr = compute_rain_heat_corrected(T2m_pt, Tsurface, aws_data['precipitation'])
+                Qg = compute_ground_heat_corrected(ST, Tsurface, time_decimal)
+                Qm = compute_melting_heat(Sin_cell, Sout, Lin, Lout, H, LE, Qr, Qg)
+
+                ablation = compute_ablation_corrected(Qm, ST, time_step_seconds,
+                                                      config["rho_snow"], config["rho_ice"],
+                                                      config["L_fs"], config["L_fi"])
+
+                # Сохраняем результат
+                results.append({
                     'datetime': current_time,
+                    'time_str': time_str,
+                    'cat': cat,
+                    'z': z,
+                    'r_sun_global_rad': G_cell,
                     'Sin_cell': Sin_cell,
-                    'G_cell': G_cell
+                    'Sout': Sout,
+                    'Lin': Lin,
+                    'Lout': Lout,
+                    'T2m': T2m_pt,
+                    'Ts': Tsurface,
+                    'H': H,
+                    'LE': LE,
+                    'Qr': Qr,
+                    'Qg': Qg,
+                    'Qm': Qm,
+                    'ablation_mm': ablation
                 })
 
-            # Температура воздуха
-            T2m_pt = compute_T2m_at_z(aws_data['T2m_AWS2'], config["kt"], z, config["z_aws2"])
+        # --- 5. Сохранение результатов ---
+        print("\n=== СОХРАНЕНИЕ ===")
+        results_df = pd.DataFrame(results)
+        if results_df.empty:
+            print("⚠ Результаты пусты!")
+        else:
+            out_file = Path(config["output_dir"]) / "model_results_full.csv"
+            results_df.to_csv(out_file, index=False)
+            print(f"✓ Сохранено строк: {len(results_df)}")
+            print(f"✓ Файл: {out_file}")
 
-            # Альбедо и тип поверхности
-            ST = 1 if z > config["bsl"] else 0
-            Ta = 50
-            alpha = compute_albedo(ST, T2m_pt, Ta, config["kSS"], config["kT2m"], config["kTa"], config["c_alpha"])
-            Sout = compute_Sout(alpha, Sin_cell)
+            expected = len(points_gdf) * len(all_times)
+            print(f"✓ Ожидалось строк примерно: {expected}")
 
-            Lin = aws_data['Lin_AWS2']
-
-            # Итерация 1
-            Lout_temp, Tsurface_temp = compute_Lout_corrected(config["epsilon"], config["sigma"], ST, 0)
-            H, LE = compute_turbulent_heat_corrected(T2m_pt, Tsurface_temp, aws_data['wind_speed'],
-                                                     aws_data['pressure'], aws_data['RH_AWS2'], z)
-            Qr = compute_rain_heat_corrected(T2m_pt, Tsurface_temp, aws_data['precipitation'])
-            Qg = compute_ground_heat_corrected(ST, Tsurface_temp, time_decimal)
-            Qm_temp = compute_melting_heat(Sin_cell, Sout, Lin, Lout_temp, H, LE, Qr, Qg)
-
-            # Итерация 2 (уточнение Lout)
-            Lout, Tsurface = compute_Lout_corrected(config["epsilon"], config["sigma"], ST, Qm_temp)
-            Rnet, Snet, Lnet = compute_Rnet(Sin_cell, Sout, Lin, Lout)
-
-            # Финальные потоки
-            H, LE = compute_turbulent_heat_corrected(T2m_pt, Tsurface, aws_data['wind_speed'],
-                                                     aws_data['pressure'], aws_data['RH_AWS2'], z)
-            Qr = compute_rain_heat_corrected(T2m_pt, Tsurface, aws_data['precipitation'])
-            Qg = compute_ground_heat_corrected(ST, Tsurface, time_decimal)
-            Qm = compute_melting_heat(Sin_cell, Sout, Lin, Lout, H, LE, Qr, Qg)
-
-            ablation = compute_ablation_corrected(Qm, ST, time_step_seconds,
-                                                  config["rho_snow"], config["rho_ice"],
-                                                  config["L_fs"], config["L_fi"])
-
-            # Сохраняем строку результата
-            results.append({
-                'datetime': current_time,
-                'time_str': time_str,
-                'cat': cat,
-                'z': z,
-                'r_sun_global_rad': G_cell,
-                'Sin_cell': Sin_cell,
-                'Sout': Sout,
-                'Lin': Lin,
-                'Lout': Lout,
-                'T2m': T2m_pt,
-                'Ts': Tsurface,
-                'H': H,
-                'LE': LE,
-                'Qr': Qr,
-                'Qg': Qg,
-                'Qm': Qm,
-                'ablation_mm': ablation
-            })
-
-        # === ВАЖНО: ПЕРЕКЛЮЧЕНИЕ ВРЕМЕНИ НАХОДИТСЯ ЗДЕСЬ ===
-        # Оно вне цикла `for point`, но внутри цикла `while current_time`
-        current_time += dt.timedelta(minutes=config["time_step_minutes"])
-
-    # --- СОХРАНЕНИЕ ---
-    print("\n=== СОХРАНЕНИЕ ===")
-    results_df = pd.DataFrame(results)
-
-    if results_df.empty:
-        print("⚠ ОШИБКА: Результаты пусты!")
-    else:
-        out_file = Path(config["output_dir"]) / "model_results_full.csv"
-        results_df.to_csv(out_file, index=False)
-        print(f"✓ Сохранено строк: {len(results_df)}")
-        print(f"✓ Файл: {out_file}")
-
-        # Проверка размера (должно быть: кол-во шагов * кол-во точек)
-        expected_rows = len(points_gdf) * len(pd.date_range(start, end, freq=f'{config["time_step_minutes"]}min'))
-        print(f"✓ Ожидалось строк примерно: {expected_rows}")
-
-    print("ГОТОВО.")
+        print("ГОТОВО.")
 
 
 def create_test_aws_data():
@@ -1082,7 +1197,6 @@ def create_test_aws_data():
     df = pd.DataFrame(data)
     df['G_AWS2'] = df['Sin_AWS2'] / df['alpha_AWS2']
     return df
-
 
 # ==================== ЗАПУСК ИСПРАВЛЕННОЙ ПРОГРАММЫ ====================
 if __name__ == "__main__":
