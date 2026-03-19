@@ -96,13 +96,13 @@ CONFIG = {
     "rho_snow": 602,
     "sigma": 5.670374419e-8,
     "epsilon": 1,
-    "z_aws1": 2540,
-    "z_aws2": 2561,
+    "z_aws1": 2536,
+    "z_aws2": 2549,
     "L_fs": 330000,
     "L_fi": 335000,
     "latitude": 56.82,
     "longitude": 117.33,
-    "timezone": 8
+    "timezone": 9
 }
 
 
@@ -503,8 +503,20 @@ def compute_ablation(Qm, ST, time_step_seconds,
 
 # ==================== СОЗДАНИЕ ТОЧЕК ====================
 def create_research_points(dem_tif, glacier_shp, num_points=100):
-    """Создаёт точки на леднике"""
+    """
+    Создаёт точки на леднике.
+    ВАЖНО: точки 94 и AWS2(96) создаются с заданными координатами!
+    """
     print(f"Создаём точки (цель: {num_points})...")
+
+    # ЭТАЛОННЫЕ КООРДИНАТЫ
+    POINT_94_X = 525285
+    POINT_94_Y = 6300765
+    POINT_94_Z = 2563
+
+    AWS2_X = 525465  # ИСПРАВЛЕНО!
+    AWS2_Y = 6300765  # ИСПРАВЛЕНО!
+    AWS2_Z = 2549  # ИСПРАВЛЕНО!
 
     with rasterio.open(dem_tif) as src:
         glacier_gdf = gpd.read_file(glacier_shp)
@@ -512,10 +524,70 @@ def create_research_points(dem_tif, glacier_shp, num_points=100):
             glacier_gdf = glacier_gdf.to_crs(src.crs)
 
         points = []
+
+        # =====================================================
+        # Добавляем точку 94
+        # =====================================================
+        print(f"Добавляем точку 94: X={POINT_94_X}, Y={POINT_94_Y}")
+
+        try:
+            row_94, col_94 = src.index(POINT_94_X, POINT_94_Y)
+            window = rasterio.windows.Window(col_94, row_94, 1, 1)
+            z_94 = src.read(1, window=window)[0, 0]
+
+            print(f"  DEM: row={row_94}, col={col_94}, Z={z_94:.1f} (ожидалось {POINT_94_Z})")
+
+            point_94_geom = gpd.points_from_xy([POINT_94_X], [POINT_94_Y])[0]
+            points.append({
+                'cat': 94,
+                'x': POINT_94_X,
+                'y': POINT_94_Y,
+                'z': z_94,
+                'row': row_94,
+                'col': col_94,
+                'geometry': point_94_geom
+            })
+        except Exception as e:
+            print(f"  ✗ Ошибка добавления точки 94: {e}")
+
+        # =====================================================
+        # Добавляем точку AWS2 (cat=96)
+        # =====================================================
+        print(f"Добавляем точку AWS2 (96): X={AWS2_X}, Y={AWS2_Y}")
+
+        try:
+            row_aws2, col_aws2 = src.index(AWS2_X, AWS2_Y)
+            window = rasterio.windows.Window(col_aws2, row_aws2, 1, 1)
+            z_aws2 = src.read(1, window=window)[0, 0]
+
+            print(f"  DEM: row={row_aws2}, col={col_aws2}, Z={z_aws2:.1f} (ожидалось {AWS2_Z})")
+
+            point_aws2_geom = gpd.points_from_xy([AWS2_X], [AWS2_Y])[0]
+            points.append({
+                'cat': 96,
+                'x': AWS2_X,
+                'y': AWS2_Y,
+                'z': z_aws2,
+                'row': row_aws2,
+                'col': col_aws2,
+                'geometry': point_aws2_geom
+            })
+        except Exception as e:
+            print(f"  ✗ Ошибка добавления точки AWS2: {e}")
+
+        # =====================================================
+        # Добавляем остальные точки
+        # =====================================================
         cat_counter = 1
 
         for j in range(0, src.height):
             for i in range(0, src.width):
+                while cat_counter in [94, 96]:
+                    cat_counter += 1
+
+                if len(points) >= num_points:
+                    break
+
                 x, y = src.xy(j, i)
                 point_geom = gpd.points_from_xy([x], [y])[0]
 
@@ -532,26 +604,22 @@ def create_research_points(dem_tif, glacier_shp, num_points=100):
                         })
                         cat_counter += 1
 
-                if len(points) >= num_points:
-                    break
             if len(points) >= num_points:
                 break
 
-        # Добавляем специальные точки (94, 96) если их нет
-        existing_cats = {p['cat'] for p in points}
-
-        if 96 not in existing_cats and len(points) > 0:
-            # AWS2 — используем первую точку как прокси
-            aws2_point = points[0].copy()
-            aws2_point['cat'] = 96
-            points.append(aws2_point)
-            print(f"  ⚠ Точка AWS2 (cat=96) добавлена как "
-                  f"копия первой точки")
-
         points_gdf = gpd.GeoDataFrame(points, crs=src.crs)
-        print(f"✓ Создано точек: {len(points_gdf)}")
-        return points_gdf
 
+        # Проверка
+        p94 = points_gdf[points_gdf['cat'] == 94]
+        p96 = points_gdf[points_gdf['cat'] == 96]
+
+        if not p94.empty:
+            print(f"\n✓ Точка 94: Z={p94.iloc[0]['z']:.1f}")
+        if not p96.empty:
+            print(f"✓ Точка AWS2 (96): Z={p96.iloc[0]['z']:.1f}")
+
+        print(f"✓ Всего создано точек: {len(points_gdf)}")
+        return points_gdf
 
 # ==================== ЗАГРУЗКА МЕТЕОДАННЫХ ====================
 def load_real_aws_data(excel_file="Test_model.xlsx",

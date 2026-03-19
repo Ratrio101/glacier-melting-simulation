@@ -156,28 +156,41 @@ def run_rsun_instantaneous(day_of_year, solar_time, output_name):
     """
     r.sun для ГОРИЗОНТАЛЬНОЙ поверхности.
     """
+    # Создаём имена для выходных растров
+    beam_name = f"beam_{output_name}"
+    diff_name = f"diff_{output_name}"
     glob_name = f"glob_{output_name}"
 
     try:
         gs.run_command(
             'r.sun',
+            # flags='p',
             elevation='DEM',
-            slope='slope_horizontal',      # БЫЛО: 'slope'
-            aspect='aspect_horizontal',    # БЫЛО: 'aspect'
+            slope='slope',
+            aspect='aspect',
             day=day_of_year,
             time=solar_time,
-            glob_rad=glob_name,
+            beam_rad=beam_name,  # прямая радиация
+            diff_rad=diff_name,  # рассеянная радиация
             linke_value=3.0,
+            horizon_basename='horizon',
+            horizon_step=5,
+            overwrite=True,
+            quiet=True
+        )
+        gs.run_command(
+            'r.mapcalc',
+            expression=f"{glob_name} = {beam_name} + {diff_name}",
             overwrite=True,
             quiet=True
         )
 
-        return glob_name
+        return glob_name, [beam_name, diff_name, glob_name]
 
     except Exception as e:
         print(f"  ⚠ r.sun ошибка для day={day_of_year}, "
               f"time={solar_time:.2f}: {e}")
-        return None
+        return None, None
 
 def extract_raster_at_points(raster_name, points_cats):
     """
@@ -804,22 +817,16 @@ def run_glacier_model(config=CONFIG):
         )
         print("✓ Данные подготовлены в GRASS")
 
-        # =====================================================
-        # Создаём горизонтальные растры для r.sun
-        # =====================================================
-        print("Создаём горизонтальные растры...")
-        gs.run_command('r.mapcalc',
-                       expression='slope_horizontal = DEM * 0',
-                       overwrite=True)
-        gs.run_command('r.mapcalc',
-                       expression='aspect_horizontal = DEM * 0 + 180',
-                       overwrite=True)
-
-        if gs.find_file('slope_horizontal', element='cell')['file']:
-            print("✓ slope_horizontal и aspect_horizontal созданы")
-        else:
-            print("✗ ОШИБКА создания горизонтальных растров!")
-            return
+        print("Создаём файлы горизонта для учёта затенения...")
+        gs.run_command(
+            'r.horizon',
+            elevation='DEM',
+            direction=0,
+            step=5,
+            output='horizon',
+            overwrite=True,
+            quiet=True
+        )
 
         # Находим cat точки AWS2
         aws2_cat = 96
@@ -866,13 +873,11 @@ def run_glacier_model(config=CONFIG):
             G_values = {}
             rasters_to_cleanup = []
 
-            if 0 < solar_time < 24 and solar_time > 3 and solar_time < 22:
-                # Запускаем r.sun
-                output_name = (f"{day_of_year}_"
-                               f"{current_time.strftime('%H%M')}")
-
-                glob_map = run_rsun_instantaneous(
-                    day_of_year, solar_time, output_name
+            if 0 < solar_time < 24:
+                # Запускаем r.sun с учётом затенения
+                glob_map, temp_rasters = run_rsun_instantaneous(
+                    day_of_year, solar_time,
+                    f"{day_of_year}_{current_time.strftime('%H%M')}"
                 )
 
                 if glob_map:
@@ -882,7 +887,7 @@ def run_glacier_model(config=CONFIG):
                     )
 
                     # Запоминаем растры для очистки
-                    rasters_to_cleanup = [glob_map]
+                    rasters_to_cleanup = temp_rasters if temp_rasters else []
 
             # Значение G в точке AWS2
             G_AWS2 = G_values.get(aws2_cat, 0.0)
