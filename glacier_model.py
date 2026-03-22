@@ -222,45 +222,45 @@ def run_rsun_for_timestep(day_of_year, local_time, output_suffix, use_horizon=Fa
 # ================================================================
 #  ИСПРАВЛЕНИЕ 3: ПРАВИЛЬНОЕ ИЗВЛЕЧЕНИЕ ЗНАЧЕНИЙ
 # ================================================================
-
 def extract_raster_values_at_points(raster_name, points_gdf):
-    """
-    Извлекает значения растра в точках.
-    Возвращает dict {cat: value}.
-    """
-    # Обновляем колонку G
-    gs.run_command(
-        'v.what.rast',
-        map='points',
-        raster=raster_name,
-        column='G',
-        quiet=True
-    )
+    coords = []
+    cats = []
 
-    # Читаем таблицу
-    table_output = gs.read_command(
-        'v.db.select',
-        map='points',
-        columns='cat,G',
+    for _, row in points_gdf.iterrows():
+        coords.append(f"{row['x']},{row['y']}")
+        cats.append(int(row['cat']))
+
+    # ВАЖНО: одна строка x1,y1,x2,y2,...
+    flat_coords = []
+    for c in coords:
+        x, y = c.split(",")
+        flat_coords.extend([x, y])
+
+    query = ",".join(flat_coords)
+
+    result = gs.read_command(
+        'r.what',
+        map=raster_name,
+        coordinates=query,
         separator='|',
         quiet=True
     )
 
     G_values = {}
-    for line in table_output.strip().split('\n'):
-        if '|' not in line or line.startswith('cat'):
-            continue
+
+    lines = result.strip().split('\n')
+
+    for i, line in enumerate(lines):
         parts = line.split('|')
-        if len(parts) >= 2:
+        if len(parts) >= 4:
             try:
-                cat = int(parts[0].strip())
-                val_str = parts[1].strip()
-                if val_str and val_str.upper() not in ('', 'NULL', '*'):
-                    G_values[cat] = float(val_str)
+                val = parts[3].strip()
+                if val and val.upper() != 'NULL':
+                    G_values[cats[i]] = float(val)
                 else:
-                    G_values[cat] = 0.0
-            except (ValueError, TypeError):
-                pass
+                    G_values[cats[i]] = 0.0
+            except:
+                G_values[cats[i]] = 0.0
 
     return G_values
 
