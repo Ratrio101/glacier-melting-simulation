@@ -279,45 +279,14 @@ def cleanup_temp_rasters(raster_list):
 #  ИСПРАВЛЕНИЕ 4: Sin_cell с правильной логикой
 # ================================================================
 
-def compute_Sin_cell(Sin_AWS2, G_cell, G_AWS2, min_G=5.0):
-    """
-    Расчёт Sin для ячейки.
-
-    Формула: Sin_cell = Sin_AWS2 × (G_cell / G_AWS2)
-
-    Где:
-    - Sin_AWS2: измеренная радиация на метеостанции (Вт/м²)
-    - G_cell: потенциальная радиация в ячейке из r.sun (Вт/м²)
-    - G_AWS2: потенциальная радиация в точке AWS2 из r.sun (Вт/м²)
-    """
-    # Ночь
-    if G_cell <= 0:
+def compute_Sin_cell(Sin_AWS2, G_cell, G_AWS2):
+    if G_cell <= 0 or Sin_AWS2 <= 0:
         return 0.0
 
-    if Sin_AWS2 <= 0:
+    if G_AWS2 <= 0:
         return 0.0
 
-    # Если G_AWS2 слишком мала (сумерки) — используем Sin_AWS2 напрямую
-    # пропорционально
-    if G_AWS2 < min_G:
-        if G_cell < min_G:
-            return Sin_AWS2
-        else:
-            # Точка освещена лучше чем AWS2
-            return min(G_cell, Sin_AWS2 * 2)
-
-    # Коэффициент облачности (отношение реальной к потенциальной)
-    cloudiness = Sin_AWS2 / G_AWS2
-
-    # Ограничение (может быть >1 из-за отражений от облаков)
-    cloudiness = max(0.0, min(1.5, cloudiness))
-
-    # Радиация в ячейке
-    sin_cell = G_cell * cloudiness
-
-    # Физический максимум
-    return min(sin_cell, 1400.0)
-
+    return Sin_AWS2 * (G_cell / G_AWS2)
 
 # ================================================================
 #  ФИЗИЧЕСКИЕ ФОРМУЛЫ (без изменений, только чистые)
