@@ -1,11 +1,4 @@
 #!/usr/bin/env python3
-"""
-ИСПРАВЛЕННАЯ ВЕРСИЯ МОДЕЛИ ТАЯНИЯ ЛЕДНИКА
-Ключевые исправления:
-1. Правильный режим r.sun (mode2 с step=0.5)
-2. Корректный расчёт солнечного времени
-3. Учёт затенения через slope/aspect (без horizon)
-"""
 
 import os
 import sys
@@ -85,7 +78,7 @@ CONFIG = {
     "output_dir": "output_model",
     "time_step_minutes": 30,
     "period_start": "2019-07-07T00:00:00",
-    "period_end": "2019-07-08T23:30:00",
+    "period_end": "2019-07-30T23:30:00",
 
     # r.sun параметры
     "linke_value": 3.0,  # коэффициент Линке
@@ -116,20 +109,8 @@ CONFIG = {
 def ensure_dir(d):
     os.makedirs(d, exist_ok=True)
 
-
-# ================================================================
-#  ИСПРАВЛЕНИЕ 1: КОРРЕКТНОЕ СОЛНЕЧНОЕ ВРЕМЯ
-#
-#  Проблема: r.sun в GRASS использует LOCAL APPARENT TIME (LAT),
-#  а не гражданское время. Нужно правильно пересчитать.
-# ================================================================
 def get_solar_time_for_rsun(datetime_obj, longitude, timezone_offset):
-    """
-       Переводит местное гражданское время в солнечное для r.sun.
 
-       r.sun использует LOCAL APPARENT TIME (солнечное время),
-       где 12:00 = солнце в зените.
-       """
     day_of_year = datetime_obj.timetuple().tm_yday
     hour_local = datetime_obj.hour + datetime_obj.minute / 60.0
 
@@ -153,10 +134,7 @@ def get_solar_time_for_rsun(datetime_obj, longitude, timezone_offset):
     return solar_time
 
 def prepare_horizon_maps():
-    """
-    Создаёт карты горизонта для учёта затенения от рельефа.
-    Вызывается ОДИН РАЗ перед основным циклом.
-    """
+
     print("Вычисляем карты горизонта (это может занять время)...")
 
     try:
@@ -173,18 +151,6 @@ def prepare_horizon_maps():
     except Exception as e:
         print(f"⚠ Ошибка создания horizon: {e}")
         return False
-
-# ================================================================
-#  ИСПРАВЛЕНИЕ 2: r.sun В ПРАВИЛЬНОМ РЕЖИМЕ
-#
-#  Заказчик использует step=0.5 — это ИНТЕГРАЛЬНЫЙ режим!
-#  В этом режиме r.sun считает сумму радиации за весь день,
-#  а не мгновенное значение.
-#
-#  Но нам нужны значения по 30-минутным интервалам!
-#  Решение: использовать режим mode1 (time=...) для каждого
-#  интервала времени.
-# ================================================================
 
 def run_rsun_for_timestep(day_of_year, local_time, output_suffix, use_horizon=False):
 
@@ -219,9 +185,6 @@ def run_rsun_for_timestep(day_of_year, local_time, output_suffix, use_horizon=Fa
         print(f"⚠ r.sun ошибка: {e}")
         return None, None
 
-# ================================================================
-#  ИСПРАВЛЕНИЕ 3: ПРАВИЛЬНОЕ ИЗВЛЕЧЕНИЕ ЗНАЧЕНИЙ
-# ================================================================
 def extract_raster_values_at_points(raster_name, points_gdf):
     coords = []
     cats = []
@@ -274,11 +237,6 @@ def cleanup_temp_rasters(raster_list):
         except:
             pass
 
-
-# ================================================================
-#  ИСПРАВЛЕНИЕ 4: Sin_cell с правильной логикой
-# ================================================================
-
 def compute_Sin_cell(Sin_AWS2, G_cell, G_AWS2):
     if G_cell <= 0 or Sin_AWS2 <= 0:
         return 0.0
@@ -288,9 +246,55 @@ def compute_Sin_cell(Sin_AWS2, G_cell, G_AWS2):
 
     return Sin_AWS2 * (G_cell / G_AWS2)
 
-# ================================================================
-#  ФИЗИЧЕСКИЕ ФОРМУЛЫ (без изменений, только чистые)
-# ================================================================
+
+def calculate_sd(albedo_df, current_date, alpha_d=0.06):
+    """
+    Рассчитывает SD (день со снегопадом) для заданной даты
+
+    SD(d) = 1 если [α(12h,d) - α(12h,d-1)] >= α_d (0.06)
+    SD(d) = 0 если разность меньше α_d
+    """
+    # Приводим current_date к началу дня (без времени)
+    current_day = current_date.replace(hour=0, minute=0, second=0, microsecond=0)
+
+    # Проверка на пустой DataFrame
+    if albedo_df.empty:
+        print(f"  ⚠ albedo_df пуст, SD = 0 для {current_day.date()}")
+        return 0
+
+    # Ищем альбедо для текущего дня в 12 часов
+    current_mask = albedo_df['date'].dt.date == current_day.date()
+    current_albedo = albedo_df[current_mask]['albedo_12h']
+
+    # Ищем альбедо для предыдущего дня
+    prev_day = current_day - dt.timedelta(days=1)
+    prev_mask = albedo_df['date'].dt.date == prev_day.date()
+    prev_albedo = albedo_df[prev_mask]['albedo_12h']
+
+    # Если данных нет для текущего или предыдущего дня
+    if len(current_albedo) == 0:
+        print(f"  ⚠ Нет данных альбедо для {current_day.date()}, SD = 0")
+        return 0
+
+    alpha_current = float(current_albedo.iloc[0])
+
+    if len(prev_albedo) == 0:
+        print(f"  ⚠ Нет данных альбедо для {prev_day.date()}, SD = 0 (первый день моделирования)")
+        print(f"     {current_day.date()}: α_curr={alpha_current:.3f}, нет данных за предыдущий день")
+        return 0
+
+    alpha_prev = float(prev_albedo.iloc[0])
+    alpha_diff = alpha_current - alpha_prev
+
+    # Формула из документации
+    if alpha_diff >= alpha_d:
+        print(
+            f"  {current_day.date()}: α_curr={alpha_current:.3f}, α_prev={alpha_prev:.3f}, diff={alpha_diff:.3f} >= {alpha_d} → SD=1 (снегопад)")
+        return 1
+    else:
+        print(
+            f"  {current_day.date()}: α_curr={alpha_current:.3f}, α_prev={alpha_prev:.3f}, diff={alpha_diff:.3f} < {alpha_d} → SD=0 (нет снегопада)")
+        return 0
 
 def compute_T2m_at_z(T2m_aws2, kt, z_cell, z_aws2):
     """Температура воздуха на высоте"""
@@ -410,10 +414,7 @@ def compute_ablation(Qm, ST, time_step_seconds, rho_snow, rho_ice, L_fs, L_fi):
     melted_mass = melting_energy / L_f
     return (melted_mass / 1000.0) * 1000.0
 
-
-# ================================================================
 #  СОЗДАНИЕ ТОЧЕК
-# ================================================================
 
 def create_research_points(dem_tif, glacier_shp, num_points=100):
     """Создаёт точки на леднике"""
@@ -482,10 +483,7 @@ def create_research_points(dem_tif, glacier_shp, num_points=100):
         print(f"✓ Всего точек: {len(points_gdf)}")
         return points_gdf
 
-
-# ================================================================
 #  ЗАГРУЗКА МЕТЕОДАННЫХ
-# ================================================================
 
 def load_aws_data(excel_file="Test_model.xlsx", sheet_name="AWS2_30min"):
     """Загружает метеоданные"""
@@ -509,7 +507,6 @@ def load_aws_data(excel_file="Test_model.xlsx", sheet_name="AWS2_30min"):
     except Exception as e:
         print(f"✗ Ошибка: {e}")
         return pd.DataFrame()
-
 
 def get_aws_at_time(aws_df, target_datetime):
     """Получает метеоданные для времени"""
@@ -568,9 +565,69 @@ def get_aws_at_time(aws_df, target_datetime):
     }
 
 
-# ================================================================
+def load_albedo_from_excel(excel_file="Test_model.xlsx", sheet_name="Albedo"):
+    """
+    Загружает альбедо в 12 часов для расчета SD (день со снегопадом)
+    Из листа Albedo, начиная с ячейки D3
+    """
+    try:
+        print(f"Загружаем альбедо (12h) из {excel_file}, лист '{sheet_name}'...")
+
+        # Читаем файл, пропускаем первые 2 строки (заголовки)
+        # header=None чтобы прочитать все данные как есть
+        df = pd.read_excel(excel_file, sheet_name=sheet_name, header=None, skiprows=2)
+
+        print(f"  Формат файла: {df.shape[0]} строк, {df.shape[1]} колонок")
+        print(f"  Первые 5 строк:")
+        for i in range(min(5, len(df))):
+            print(f"    Строка {i}: {df.iloc[i, :3].values} ...")
+
+        # По описанию: колонка A (индекс 0) - дата, колонка D (индекс 3) - альбедо в 12h
+        # Но в вашем выводе видно, что альбедо находится в колонке с индексом 3
+
+        # Создаем DataFrame с правильными колонками
+        df_albedo = pd.DataFrame()
+
+        # Дата - первая колонка (индекс 0)
+        df_albedo['date'] = df.iloc[:, 0]
+
+        # Альбедо в 12h - четвертая колонка (индекс 3)
+        df_albedo['albedo_12h'] = df.iloc[:, 3]
+
+        # Преобразуем дату в datetime
+        df_albedo['date'] = pd.to_datetime(df_albedo['date'], errors='coerce')
+
+        # Преобразуем альбедо в числа (удаляем возможные текстовые значения)
+        df_albedo['albedo_12h'] = pd.to_numeric(df_albedo['albedo_12h'], errors='coerce')
+
+        # Удаляем строки с некорректной датой или NaN
+        initial_len = len(df_albedo)
+        df_albedo = df_albedo.dropna(subset=['date', 'albedo_12h'])
+
+        # Также удаляем строки, где альбедо > 1 (это явно не альбедо, а какие-то другие данные)
+        df_albedo = df_albedo[df_albedo['albedo_12h'] <= 1.0]
+
+        print(f"  Удалено {initial_len - len(df_albedo)} строк с некорректными данными")
+
+        # Сортируем по дате
+        df_albedo = df_albedo.sort_values('date').reset_index(drop=True)
+
+        print(f"✓ Загружено {len(df_albedo)} записей альбедо в 12h")
+        if len(df_albedo) > 0:
+            print(f"  Диапазон дат: {df_albedo['date'].min().date()} - {df_albedo['date'].max().date()}")
+            print(f"  Первые 5 записей:")
+            for i in range(min(5, len(df_albedo))):
+                print(f"    {df_albedo.iloc[i]['date'].date()}: {df_albedo.iloc[i]['albedo_12h']:.3f}")
+
+        return df_albedo
+
+    except Exception as e:
+        print(f"✗ Ошибка загрузки альбедо: {e}")
+        import traceback
+        traceback.print_exc()
+        return pd.DataFrame()
+
 #  ГЛАВНАЯ ФУНКЦИЯ
-# ================================================================
 
 def run_glacier_model(config=CONFIG):
     print("=" * 60)
@@ -584,6 +641,16 @@ def run_glacier_model(config=CONFIG):
     if aws_df.empty:
         print("✗ Нет метеоданных!")
         return
+
+    albedo_df = load_albedo_from_excel()
+    if albedo_df.empty:
+        print("⚠ Внимание: не удалось загрузить альбедо для расчета SD!")
+        print("  SD будет всегда = 0")
+    else:
+        # Выводим все даты и значения для проверки
+        print("\n=== ДАННЫЕ АЛЬБЕДО (12h) ===")
+        for idx, row in albedo_df.iterrows():
+            print(f"  {row['date'].date()}: {row['albedo_12h']:.3f}")
 
     # 2. Точки
     points_gdf = create_research_points(config["dem_tif"], config["glacier_shp"])
@@ -639,14 +706,18 @@ def run_glacier_model(config=CONFIG):
         for step_i, current_time in enumerate(all_times):
             day_of_year = current_time.timetuple().tm_yday
 
+            # Вычисляем SD для текущего дня (один раз в начале дня)
+            # SD одинаков для всех ячеек в данный день
+            if current_time.hour == 0 and current_time.minute == 0:
+                # В начале каждого дня пересчитываем SD
+                sd = calculate_sd(albedo_df, current_time, alpha_d=0.06)
+                print(
+                    f"  SD для {current_time.strftime('%Y-%m-%d')}: {sd} {'(снегопад)' if sd == 1 else '(без снегопада)'}")
+            # SD сохраняется на весь день
+
             if current_time.day != prev_day:
                 prev_day = current_time.day
                 print(f"\n--- {current_time.strftime('%Y-%m-%d')} ({step_i + 1}/{len(all_times)}) ---")
-
-            # =====================================================
-            # ИСПРАВЛЕНИЕ: используем местное время напрямую
-            # (как заказчик в QGIS)
-            # =====================================================
 
             solar_time = current_time.hour + current_time.minute / 60.0
 
@@ -722,6 +793,7 @@ def run_glacier_model(config=CONFIG):
                     'cat': cat,
                     'z': z,
                     'ST': ST,
+                    'SD': sd,
                     'G_rsun': round(G_cell, 2),
                     'G_AWS2_rsun': round(G_AWS2, 2),
                     'Sin_AWS2': round(aws_data['Sin_AWS2'], 2),
@@ -751,9 +823,8 @@ def run_glacier_model(config=CONFIG):
             if rasters_to_cleanup:
                 cleanup_temp_rasters(rasters_to_cleanup)
 
-    # ========================================
     #  СОХРАНЕНИЕ
-    # ========================================
+
     print("\n" + "=" * 60)
     print("СОХРАНЕНИЕ")
     print("=" * 60)
@@ -795,9 +866,7 @@ def run_glacier_model(config=CONFIG):
     print(f"Sin_cell: min={results_df['Sin_cell'].min():.1f}, max={results_df['Sin_cell'].max():.1f}")
     print(f"Qm: min={results_df['Qm'].min():.1f}, max={results_df['Qm'].max():.1f}")
     print(f"Абляция: {results_df['ablation_mm'].sum():.2f} мм")
-
     print("\n✓ ГОТОВО!")
-
 
 if __name__ == "__main__":
     run_glacier_model()

@@ -1,11 +1,4 @@
 #!/usr/bin/env python3
-"""
-ИСПРАВЛЕННАЯ ВЕРСИЯ МОДЕЛИ ТАЯНИЯ ЛЕДНИКА
-Ключевые исправления:
-1. Правильный режим r.sun (mode2 с step=0.5)
-2. Корректный расчёт солнечного времени
-3. Учёт затенения через slope/aspect (без horizon)
-"""
 
 import os
 import sys
@@ -85,10 +78,9 @@ CONFIG = {
     "output_dir": "output_model",
     "time_step_minutes": 30,
     "period_start": "2019-07-07T00:00:00",
-    "period_end": "2019-07-08T23:30:00",
+    "period_end": "2019-08-31T23:30:00",
 
-    # r.sun параметры (КАК У ЗАКАЗЧИКА!)
-    "rsun_step": 0.5,  # 30 минут в часах
+    # r.sun параметры
     "linke_value": 3.0,  # коэффициент Линке
     "albedo_value": 0.2,  # альбедо для r.sun
 
@@ -117,212 +109,121 @@ CONFIG = {
 def ensure_dir(d):
     os.makedirs(d, exist_ok=True)
 
-
-# ================================================================
-#  ИСПРАВЛЕНИЕ 1: КОРРЕКТНОЕ СОЛНЕЧНОЕ ВРЕМЯ
-#
-#  Проблема: r.sun в GRASS использует LOCAL APPARENT TIME (LAT),
-#  а не гражданское время. Нужно правильно пересчитать.
-# ================================================================
 def get_solar_time_for_rsun(datetime_obj, longitude, timezone_offset):
-    """
-    Вычисляет время для r.sun.
 
-    ВАЖНО: r.sun ожидает МЕСТНОЕ СОЛНЕЧНОЕ ВРЕМЯ (Local Apparent Time).
-    Но если работаем в UTC или местном гражданском — нужна коррекция.
-
-    Для простоты: если заказчик использует time=12 для полудня по местному,
-    то мы тоже используем местное гражданское время напрямую.
-    """
-    # Заказчик использует местное гражданское время напрямую!
-    # Он ставит time=12 для местного полудня (UTC+9)
-    # Значит, мы просто берём час из datetime
-
-    hour_decimal = datetime_obj.hour + datetime_obj.minute / 60.0
-
-    return hour_decimal
-
-
-def get_solar_time_corrected(datetime_obj, longitude, timezone_offset):
-    """
-    Альтернативный вариант с полной коррекцией.
-    Используй если простой вариант не работает.
-    """
     day_of_year = datetime_obj.timetuple().tm_yday
-    hour_decimal = datetime_obj.hour + datetime_obj.minute / 60.0
+    hour_local = datetime_obj.hour + datetime_obj.minute / 60.0
 
-    # Уравнение времени (минуты)
+    # Уравнение времени (в минутах)
     B = 360.0 / 365.0 * (day_of_year - 81)
     B_rad = math.radians(B)
     EoT = (9.87 * math.sin(2 * B_rad)
            - 7.53 * math.cos(B_rad)
            - 1.5 * math.sin(B_rad))
 
-    # Коррекция на долготу
-    # Стандартный меридиан: 15° × часовой_пояс
+    # Стандартный меридиан для часового пояса (UTC+9 → 135°)
     standard_meridian = 15.0 * timezone_offset  # 135° для UTC+9
+
+    # Поправка на долготу: 4 минуты на каждый градус
+    # Если longitude < standard_meridian, солнце приходит ПОЗЖЕ
     longitude_correction = 4.0 * (longitude - standard_meridian)  # минуты
 
     # Солнечное время
-    solar_time = hour_decimal + (EoT + longitude_correction) / 60.0
+    solar_time = hour_local + (EoT + longitude_correction) / 60.0
 
     return solar_time
 
+def prepare_horizon_maps():
 
-# ================================================================
-#  ИСПРАВЛЕНИЕ 2: r.sun В ПРАВИЛЬНОМ РЕЖИМЕ
-#
-#  Заказчик использует step=0.5 — это ИНТЕГРАЛЬНЫЙ режим!
-#  В этом режиме r.sun считает сумму радиации за весь день,
-#  а не мгновенное значение.
-#
-#  Но нам нужны значения по 30-минутным интервалам!
-#  Решение: использовать режим mode1 (time=...) для каждого
-#  интервала времени.
-# ================================================================
+    print("Вычисляем карты горизонта (это может занять время)...")
 
-def run_rsun_for_timestep(day_of_year, local_time, output_suffix):
-    """
-    Запуск r.sun в режиме mode1 (мгновенная радиация).
+    try:
+        gs.run_command(
+            'r.horizon',
+            elevation='DEM',
+            output='horizon',
+            step=30,  # шаг 30° (12 направлений)
+            overwrite=True,
+            quiet=True
+        )
+        print("✓ Карты горизонта созданы")
+        return True
+    except Exception as e:
+        print(f"⚠ Ошибка создания horizon: {e}")
+        return False
 
-    ВАЖНО:
-    - Без horizon (заказчик его не использует)
-    - Без флага -p
-    - Затенение учитывается через slope/aspect автоматически
+def run_rsun_for_timestep(day_of_year, local_time, output_suffix, use_horizon=False):
 
-    Параметры:
-        day_of_year: день года (1-365)
-        local_time: местное время (0-24, дробное)
-        output_suffix: суффикс для имён растров
-
-    Возвращает:
-        (glob_raster_name, temp_rasters_list) или (None, None)
-    """
-
-    # Проверяем диапазон времени
     if local_time < 0 or local_time >= 24:
         return None, None
 
-    # Имена выходных растров
-    beam_name = f"beam_{output_suffix}"
-    diff_name = f"diff_{output_suffix}"
-    refl_name = f"refl_{output_suffix}"
     glob_name = f"glob_{output_suffix}"
 
     try:
-        # =====================================================
-        # КЛЮЧЕВОЕ ИСПРАВЛЕНИЕ:
-        # Используем параметры КАК У ЗАКАЗЧИКА
-        # =====================================================
-        gs.run_command(
-            'r.sun',
-            elevation='DEM',
-            aspect='aspect',
-            slope='slope',
-            day=day_of_year,
-            time=local_time,  # местное время!
-            # step - НЕ задаём! Это mode1 (мгновенный)
-            beam_rad=beam_name,
-            diff_rad=diff_name,
-            refl_rad=refl_name,
-            linke_value=3.0,  # как у заказчика
-            albedo_value=0.2,  # как у заказчика
-            # horizon_basename - НЕ задаём (как у заказчика!)
-            # distance_step=1,         # по умолчанию
-            overwrite=True,
-            quiet=True
-        )
+        params = {
+            'elevation': 'DEM',
+            'aspect': 'aspect',
+            'slope': 'slope',
+            'day': day_of_year,
+            'time': local_time,
+            'glob_rad': glob_name,
+            'linke_value': 3.0,
+            'albedo_value': 0.2,
+            'overwrite': True,
+            'quiet': True
+        }
 
-        # Суммарная радиация = прямая + рассеянная + отражённая
-        gs.run_command(
-            'r.mapcalc',
-            expression=f"{glob_name} = {beam_name} + {diff_name} + {refl_name}",
-            overwrite=True,
-            quiet=True
-        )
+        if use_horizon:
+            params['horizon_basename'] = 'horizon'
+            params['horizon_step'] = 30
 
-        return glob_name, [beam_name, diff_name, refl_name, glob_name]
+        gs.run_command('r.sun', **params)
+
+        return glob_name, [glob_name]
 
     except Exception as e:
-        print(f"  ⚠ r.sun ошибка: day={day_of_year}, time={local_time:.2f}: {e}")
+        print(f"⚠ r.sun ошибка: {e}")
         return None, None
 
-
-def run_rsun_mode2_daily(day_of_year):
-    """
-    Альтернатива: r.sun в режиме mode2 (суточная сумма).
-
-    Это то, что делает заказчик с step=0.5.
-    Возвращает суммарную радиацию за ВЕСЬ ДЕНЬ.
-
-    НО: нам нужны 30-минутные интервалы, поэтому этот метод
-    не подходит напрямую. Оставляю для справки.
-    """
-    try:
-        gs.run_command(
-            'r.sun',
-            elevation='DEM',
-            aspect='aspect',
-            slope='slope',
-            day=day_of_year,
-            step=0.5,  # 30 минут — режим mode2!
-            beam_rad='beam_daily',
-            diff_rad='diff_daily',
-            refl_rad='refl_daily',
-            glob_rad='glob_daily',
-            linke_value=3.0,
-            albedo_value=0.2,
-            overwrite=True,
-            quiet=True
-        )
-        return 'glob_daily'
-    except Exception as e:
-        print(f"  ⚠ r.sun mode2 ошибка: {e}")
-        return None
-
-
-# ================================================================
-#  ИСПРАВЛЕНИЕ 3: ПРАВИЛЬНОЕ ИЗВЛЕЧЕНИЕ ЗНАЧЕНИЙ
-# ================================================================
-
 def extract_raster_values_at_points(raster_name, points_gdf):
-    """
-    Извлекает значения растра в точках.
-    Возвращает dict {cat: value}.
-    """
-    # Обновляем колонку G
-    gs.run_command(
-        'v.what.rast',
-        map='points',
-        raster=raster_name,
-        column='G',
-        quiet=True
-    )
+    coords = []
+    cats = []
 
-    # Читаем таблицу
-    table_output = gs.read_command(
-        'v.db.select',
-        map='points',
-        columns='cat,G',
+    for _, row in points_gdf.iterrows():
+        coords.append(f"{row['x']},{row['y']}")
+        cats.append(int(row['cat']))
+
+    # ВАЖНО: одна строка x1,y1,x2,y2,...
+    flat_coords = []
+    for c in coords:
+        x, y = c.split(",")
+        flat_coords.extend([x, y])
+
+    query = ",".join(flat_coords)
+
+    result = gs.read_command(
+        'r.what',
+        map=raster_name,
+        coordinates=query,
         separator='|',
         quiet=True
     )
 
     G_values = {}
-    for line in table_output.strip().split('\n'):
-        if '|' not in line or line.startswith('cat'):
-            continue
+
+    lines = result.strip().split('\n')
+
+    for i, line in enumerate(lines):
         parts = line.split('|')
-        if len(parts) >= 2:
+        if len(parts) >= 4:
             try:
-                cat = int(parts[0].strip())
-                val_str = parts[1].strip()
-                if val_str and val_str.upper() not in ('', 'NULL', '*'):
-                    G_values[cat] = float(val_str)
+                val = parts[3].strip()
+                if val and val.upper() != 'NULL':
+                    G_values[cats[i]] = float(val)
                 else:
-                    G_values[cat] = 0.0
-            except (ValueError, TypeError):
-                pass
+                    G_values[cats[i]] = 0.0
+            except:
+                G_values[cats[i]] = 0.0
 
     return G_values
 
@@ -336,54 +237,14 @@ def cleanup_temp_rasters(raster_list):
         except:
             pass
 
-
-# ================================================================
-#  ИСПРАВЛЕНИЕ 4: Sin_cell с правильной логикой
-# ================================================================
-
-def compute_Sin_cell(Sin_AWS2, G_cell, G_AWS2, min_G=5.0):
-    """
-    Расчёт Sin для ячейки.
-
-    Формула: Sin_cell = Sin_AWS2 × (G_cell / G_AWS2)
-
-    Где:
-    - Sin_AWS2: измеренная радиация на метеостанции (Вт/м²)
-    - G_cell: потенциальная радиация в ячейке из r.sun (Вт/м²)
-    - G_AWS2: потенциальная радиация в точке AWS2 из r.sun (Вт/м²)
-    """
-    # Ночь
-    if G_cell <= 0:
+def compute_Sin_cell(Sin_AWS2, G_cell, G_AWS2):
+    if G_cell <= 0 or Sin_AWS2 <= 0:
         return 0.0
 
-    if Sin_AWS2 <= 0:
+    if G_AWS2 <= 0:
         return 0.0
 
-    # Если G_AWS2 слишком мала (сумерки) — используем Sin_AWS2 напрямую
-    # пропорционально
-    if G_AWS2 < min_G:
-        if G_cell < min_G:
-            return Sin_AWS2
-        else:
-            # Точка освещена лучше чем AWS2
-            return min(G_cell, Sin_AWS2 * 2)
-
-    # Коэффициент облачности (отношение реальной к потенциальной)
-    cloudiness = Sin_AWS2 / G_AWS2
-
-    # Ограничение (может быть >1 из-за отражений от облаков)
-    cloudiness = max(0.0, min(1.5, cloudiness))
-
-    # Радиация в ячейке
-    sin_cell = G_cell * cloudiness
-
-    # Физический максимум
-    return min(sin_cell, 1400.0)
-
-
-# ================================================================
-#  ФИЗИЧЕСКИЕ ФОРМУЛЫ (без изменений, только чистые)
-# ================================================================
+    return Sin_AWS2 * (G_cell / G_AWS2)
 
 def compute_T2m_at_z(T2m_aws2, kt, z_cell, z_aws2):
     """Температура воздуха на высоте"""
@@ -503,10 +364,7 @@ def compute_ablation(Qm, ST, time_step_seconds, rho_snow, rho_ice, L_fs, L_fi):
     melted_mass = melting_energy / L_f
     return (melted_mass / 1000.0) * 1000.0
 
-
-# ================================================================
 #  СОЗДАНИЕ ТОЧЕК
-# ================================================================
 
 def create_research_points(dem_tif, glacier_shp, num_points=100):
     """Создаёт точки на леднике"""
@@ -575,10 +433,7 @@ def create_research_points(dem_tif, glacier_shp, num_points=100):
         print(f"✓ Всего точек: {len(points_gdf)}")
         return points_gdf
 
-
-# ================================================================
 #  ЗАГРУЗКА МЕТЕОДАННЫХ
-# ================================================================
 
 def load_aws_data(excel_file="Test_model.xlsx", sheet_name="AWS2_30min"):
     """Загружает метеоданные"""
@@ -602,7 +457,6 @@ def load_aws_data(excel_file="Test_model.xlsx", sheet_name="AWS2_30min"):
     except Exception as e:
         print(f"✗ Ошибка: {e}")
         return pd.DataFrame()
-
 
 def get_aws_at_time(aws_df, target_datetime):
     """Получает метеоданные для времени"""
@@ -660,10 +514,7 @@ def get_aws_at_time(aws_df, target_datetime):
         'pressure': 750.0, 'precipitation': 0.0, 'alpha_AWS2': 0.5
     }
 
-
-# ================================================================
 #  ГЛАВНАЯ ФУНКЦИЯ
-# ================================================================
 
 def run_glacier_model(config=CONFIG):
     print("=" * 60)
@@ -707,6 +558,13 @@ def run_glacier_model(config=CONFIG):
             gs.run_command('r.slope.aspect', elevation='DEM',
                            slope='slope', aspect='aspect', overwrite=True)
 
+        horizon_exists = gs.find_file('horizon_000', element='cell')['file']
+        if not horizon_exists:
+            use_horizon = prepare_horizon_maps()
+        else:
+            print("✓ Карты горизонта уже существуют")
+            use_horizon = True
+
         # Импорт точек
         tmp_shp = os.path.join(tempfile.gettempdir(), "research_points.shp")
         points_gdf.to_file(tmp_shp)
@@ -729,11 +587,7 @@ def run_glacier_model(config=CONFIG):
                 prev_day = current_time.day
                 print(f"\n--- {current_time.strftime('%Y-%m-%d')} ({step_i + 1}/{len(all_times)}) ---")
 
-            # =====================================================
-            # ИСПРАВЛЕНИЕ: используем местное время напрямую
-            # (как заказчик в QGIS)
-            # =====================================================
-            local_time = current_time.hour + current_time.minute / 60.0
+            solar_time = current_time.hour + current_time.minute / 60.0
 
             # Метеоданные
             aws_data = get_aws_at_time(aws_df, current_time)
@@ -742,10 +596,11 @@ def run_glacier_model(config=CONFIG):
             G_values = {}
             rasters_to_cleanup = []
 
-            if 0 < local_time < 24:
+            if 0 < solar_time < 24:
                 output_suffix = f"d{day_of_year}_t{current_time.strftime('%H%M')}"
                 glob_map, temp_rasters = run_rsun_for_timestep(
-                    day_of_year, local_time, output_suffix
+                    day_of_year, solar_time, output_suffix,
+                    use_horizon=False
                 )
 
                 if glob_map:
@@ -802,7 +657,7 @@ def run_glacier_model(config=CONFIG):
                 results.append({
                     'datetime': current_time,
                     'day_of_year': day_of_year,
-                    'local_time': round(local_time, 2),
+                    'solar_time': round(solar_time, 2),
                     'cat': cat,
                     'z': z,
                     'ST': ST,
@@ -835,9 +690,8 @@ def run_glacier_model(config=CONFIG):
             if rasters_to_cleanup:
                 cleanup_temp_rasters(rasters_to_cleanup)
 
-    # ========================================
     #  СОХРАНЕНИЕ
-    # ========================================
+
     print("\n" + "=" * 60)
     print("СОХРАНЕНИЕ")
     print("=" * 60)
@@ -879,9 +733,7 @@ def run_glacier_model(config=CONFIG):
     print(f"Sin_cell: min={results_df['Sin_cell'].min():.1f}, max={results_df['Sin_cell'].max():.1f}")
     print(f"Qm: min={results_df['Qm'].min():.1f}, max={results_df['Qm'].max():.1f}")
     print(f"Абляция: {results_df['ablation_mm'].sum():.2f} мм")
-
     print("\n✓ ГОТОВО!")
-
 
 if __name__ == "__main__":
     run_glacier_model()
