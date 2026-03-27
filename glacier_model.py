@@ -78,7 +78,7 @@ CONFIG = {
     "output_dir": "output_model",
     "time_step_minutes": 30,
     "period_start": "2019-07-07T00:00:00",
-    "period_end": "2019-07-30T23:30:00",
+    "period_end": "2019-07-10T23:30:00",
 
     # r.sun параметры
     "linke_value": 3.0,  # коэффициент Линке
@@ -295,6 +295,15 @@ def calculate_sd(albedo_df, current_date, alpha_d=0.06):
         print(
             f"  {current_day.date()}: α_curr={alpha_current:.3f}, α_prev={alpha_prev:.3f}, diff={alpha_diff:.3f} < {alpha_d} → SD=0 (нет снегопада)")
         return 0
+
+def calculate_zsl(current_date, asl, bsl):
+    # Получаем порядковый день года (1-365)
+    day_of_year = current_date.timetuple().tm_yday
+
+    # Рассчитываем Z_sl по формуле линейной регрессии
+    zsl = asl * day_of_year + bsl
+
+    return zsl
 
 def compute_T2m_at_z(T2m_aws2, kt, z_cell, z_aws2):
     """Температура воздуха на высоте"""
@@ -702,6 +711,8 @@ def run_glacier_model(config=CONFIG):
         #  ГЛАВНЫЙ ЦИКЛ
         # ========================================
         prev_day = -1
+        sd = 0  # начальное значение SD
+        zsl = config["bsl"]  # начальное значение Z_sl
 
         for step_i, current_time in enumerate(all_times):
             day_of_year = current_time.timetuple().tm_yday
@@ -709,10 +720,10 @@ def run_glacier_model(config=CONFIG):
             # Вычисляем SD для текущего дня (один раз в начале дня)
             # SD одинаков для всех ячеек в данный день
             if current_time.hour == 0 and current_time.minute == 0:
-                # В начале каждого дня пересчитываем SD
+                # В начале каждого дня пересчитываем SD и zsl
                 sd = calculate_sd(albedo_df, current_time, alpha_d=0.06)
-                print(
-                    f"  SD для {current_time.strftime('%Y-%m-%d')}: {sd} {'(снегопад)' if sd == 1 else '(без снегопада)'}")
+                zsl = calculate_zsl(current_time, config["asl"], config["bsl"])
+                print(f"  SD для {current_time.strftime('%Y-%m-%d')}: {sd} {'(снегопад)' if sd == 1 else '(без снегопада)'}, Z_sl={zsl:.1f} м")
             # SD сохраняется на весь день
 
             if current_time.day != prev_day:
@@ -754,7 +765,10 @@ def run_glacier_model(config=CONFIG):
                 T2m_pt = compute_T2m_at_z(aws_data['T2m_AWS2'], config["kt"], z, config["z_aws2"])
 
                 # Тип поверхности
-                ST = 1 if z > config["bsl"] else 0
+                if sd == 1 or z >= zsl:
+                    ST = 1  # снег
+                else:
+                    ST = 0  # лед
 
                 # Альбедо
                 Ta = 50
@@ -794,6 +808,7 @@ def run_glacier_model(config=CONFIG):
                     'z': z,
                     'ST': ST,
                     'SD': sd,
+                    'Z_sl': round(zsl, 1),
                     'G_rsun': round(G_cell, 2),
                     'G_AWS2_rsun': round(G_AWS2, 2),
                     'Sin_AWS2': round(aws_data['Sin_AWS2'], 2),
