@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 
+# Модули и библиотеки, необходимые для работы программы
 import os
 import sys
 import math
@@ -12,14 +13,17 @@ import geopandas as gpd
 import rasterio
 
 # ===== НАСТРОЙКА GRASS GIS =====
-grass_base = r"C:\GRASS"
+grass_base = r"C:\GRASS" # база GRASS GIS
 
+# Проверка на наличие базы GRASS GIS
 if not os.path.exists(grass_base):
     print(f"✗ GRASS не найден в {grass_base}")
     sys.exit(1)
 
+# Добавление системной переменной в среду
 os.environ['GISBASE'] = grass_base
 
+# Присоединение каталогов (путей)
 grass_bin = os.path.join(grass_base, "bin")
 grass_lib = os.path.join(grass_base, "lib")
 grass_scripts = os.path.join(grass_base, "scripts")
@@ -42,6 +46,7 @@ os.environ['GRASSBIN'] = os.path.join(grass_base, "grass78.bat")
 os.environ['GRASS_PYTHON'] = sys.executable
 os.environ['GRASS_SH'] = os.path.join(grass_base, "msys", "bin", "sh.exe")
 
+# Запуск сессии GRASS GIS
 try:
     import grass.script as gs
     import grass.script.setup as gsetup
@@ -60,55 +65,56 @@ except ImportError:
     sys.exit(1)
 
 # ===== ПУТИ К ДАННЫМ =====
-GRASS_DB = r"C:\GRASS\grassdata"
-LOCATION = "glacier_TEST"
-MAPSET = "PERMANENT"
+GRASS_DB = r"C:\GRASS\grassdata" # база данных GRASS
+LOCATION = "glacier_TEST" # локация GRASS
+MAPSET = "PERMANENT" # набор карт GRASS
 
 os.makedirs(GRASS_DB, exist_ok=True)
 
-# ---------------------------
-# ========== CONFIG =========
-# ---------------------------
+# ---------------------------------------------------
+# ========== CONFIG - постоянные переменные =========
+# ---------------------------------------------------
 CONFIG = {
-    "dem_tif": "DEM.tif",
-    "elevation_tif": "elevation.tif",
-    "slope_tif": "slope.tif",
-    "aspect_tif": "aspect.tif",
-    "glacier_shp": "glacier.shp",
-    "output_dir": "output_model",
-    "time_step_minutes": 30,
-    "period_start": "2019-07-07T00:00:00",
-    "period_end": "2019-07-10T23:30:00",
+    "dem_tif": "DEM.tif",                   # маска ледника
+    "elevation_tif": "elevation.tif",       # высота
+    "slope_tif": "slope.tif",               # уклон
+    "aspect_tif": "aspect.tif",             # направление уклона (азимут)
+    "glacier_shp": "glacier.shp",           # shape-файл ледника
+    "output_dir": "output_model",           # выходная модель (директория)
+    "time_step_minutes": 30,                # шаг вычислений
+    "period_start": "2019-07-07T00:00:00",  # начальный период времени
+    "period_end": "2019-07-10T23:30:00",    # конечный период времени
 
     # r.sun параметры
-    "linke_value": 3.0,  # коэффициент Линке
-    "albedo_value": 0.2,  # альбедо для r.sun
+    "linke_value": 3.0,                     # коэффициент Линке = 3
+    "albedo_value": 0.2,                    # альбедо для расчета r.sun = 0.2
 
     # Физические константы
-    "kt": -0.0065,
-    "asl": 1.7813,
-    "bsl": 2067.6,
-    "kSS": 0.33745,
-    "kT2m": 0.00838,
-    "kTa": -0.00112,
-    "c_alpha": 0.13469,
-    "rho_ice": 784,
-    "rho_snow": 602,
-    "sigma": 5.670374419e-8,
-    "epsilon": 1,
-    "z_aws1": 2536,
-    "z_aws2": 2549,
-    "L_fs": 330000,
-    "L_fi": 335000,
-    "latitude": 56.82,
-    "longitude": 117.33,
-    "timezone": 9
+    "kt": -0.0065,                          # вертикальный градиент температуры воздуха
+    "asl": 1.7813,                          # коэффициент линейной регрессии в формуле расчета высоты снеговой линии
+    "bsl": 2067.6,                          # коэффициент линейной регрессии в формуле расчета высоты снеговой линии
+    "kSS": 0.33745,                         # коэффициент линейной регрессии в формуле расчета альбедо α
+    "kT2m": 0.00838,                        # коэффициент линейной регрессии в формуле расчета альбедо α
+    "kTa": -0.00112,                        # коэффициент линейной регрессии в формуле расчета альбедо α
+    "c_alpha": 0.13469,                     # коэффициент линейной регрессии в формуле расчета альбедо α
+    "rho_ice": 784,                         # средняя плотность льда
+    "rho_snow": 602,                        # средняя плотность снега
+    "sigma": 5.670374419e-8,                # постоянная Стефана-Больцмана
+    "epsilon": 1,                           # излучательная способность поверхности
+    "z_aws1": 2536,                         # высота метеостанции на морене
+    "z_aws2": 2549,                         # высота метеостанции на леднике
+    "L_fs": 330000,                         # скрытая теплота плавления снега
+    "L_fi": 335000,                         # скрытая теплота плавления льда
+    "latitude": 56.82,                      # широта
+    "longitude": 117.33,                    # долгота
+    "timezone": 9                           # часовой пояс
 }
 
 
 def ensure_dir(d):
     os.makedirs(d, exist_ok=True)
 
+# Алгоритм определения солнечного времени для расчета радиации r.sun
 def get_solar_time_for_rsun(datetime_obj, longitude, timezone_offset):
 
     day_of_year = datetime_obj.timetuple().tm_yday
@@ -133,6 +139,7 @@ def get_solar_time_for_rsun(datetime_obj, longitude, timezone_offset):
 
     return solar_time
 
+# Вычисление карт горизонта с использованием GRASS
 def prepare_horizon_maps():
 
     print("Вычисляем карты горизонта (это может занять время)...")
@@ -152,6 +159,7 @@ def prepare_horizon_maps():
         print(f"⚠ Ошибка создания horizon: {e}")
         return False
 
+# Расчет r.sun с использованием GRASS
 def run_rsun_for_timestep(day_of_year, local_time, output_suffix, use_horizon=False):
 
     if local_time < 0 or local_time >= 24:
@@ -185,6 +193,7 @@ def run_rsun_for_timestep(day_of_year, local_time, output_suffix, use_horizon=Fa
         print(f"⚠ r.sun ошибка: {e}")
         return None, None
 
+# Алгоритм извлечения растровых значений по точкам с использованием GRASS
 def extract_raster_values_at_points(raster_name, points_gdf):
     coords = []
     cats = []
@@ -227,7 +236,7 @@ def extract_raster_values_at_points(raster_name, points_gdf):
 
     return G_values
 
-
+# Очистка временных растров
 def cleanup_temp_rasters(raster_list):
     """Удаляет временные растры"""
     for name in raster_list:
@@ -237,6 +246,7 @@ def cleanup_temp_rasters(raster_list):
         except:
             pass
 
+# Расчет приходящей радиации по ячейкам
 def compute_Sin_cell(Sin_AWS2, G_cell, G_AWS2):
     if G_cell <= 0 or Sin_AWS2 <= 0:
         return 0.0
@@ -246,7 +256,7 @@ def compute_Sin_cell(Sin_AWS2, G_cell, G_AWS2):
 
     return Sin_AWS2 * (G_cell / G_AWS2)
 
-
+# Алгоритм определения дня со снегопадом
 def calculate_sd(albedo_df, current_date, alpha_d=0.06):
     """
     Рассчитывает SD (день со снегопадом) для заданной даты
@@ -296,6 +306,7 @@ def calculate_sd(albedo_df, current_date, alpha_d=0.06):
             f"  {current_day.date()}: α_curr={alpha_current:.3f}, α_prev={alpha_prev:.3f}, diff={alpha_diff:.3f} < {alpha_d} → SD=0 (нет снегопада)")
         return 0
 
+# Расчет высоты снеговой линии (по формуле регрессии)
 def calculate_zsl(current_date, asl, bsl):
     # Получаем порядковый день года (1-365)
     day_of_year = current_date.timetuple().tm_yday
@@ -922,5 +933,6 @@ def run_glacier_model(config=CONFIG):
     print(f"Абляция: {results_df['ablation_mm'].sum():.2f} мм")
     print("\n✓ ГОТОВО!")
 
+# ЗАПУСК МОДЕЛИ
 if __name__ == "__main__":
     run_glacier_model()
