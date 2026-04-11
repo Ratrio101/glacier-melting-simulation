@@ -82,8 +82,8 @@ CONFIG = {
     "glacier_shp": "glacier.shp",           # shape-файл ледника
     "output_dir": "output_model",           # выходная модель (директория)
     "time_step_minutes": 30,                # шаг вычислений
-    "period_start": "2019-07-07T00:00:00",  # начальный период времени
-    "period_end": "2019-07-10T23:30:00",    # конечный период времени
+    "period_start": "2019-07-30T00:00:00",  # начальный период времени
+    "period_end": "2019-07-30T23:30:00",    # конечный период времени
 
     # r.sun параметры
     "linke_value": 3.0,                     # коэффициент Линке = 3
@@ -587,66 +587,58 @@ def get_aws_at_time(aws_df, target_datetime):
 
 def load_albedo_from_excel(excel_file="Test_model.xlsx", sheet_name="Albedo"):
     """
-    Загружает альбедо в 12 часов для расчета SD (день со снегопадом)
-    Из листа Albedo, начиная с ячейки D3
+    Загружает суточные данные из листа Albedo:
+      col 0 (A) - дата
+      col 3 (D) - альбедо в 12h  (для расчёта SD)
+      col 4 (E) - T2m(AWS2,d)    средняя суточная температура
+      col 6 (G) - nd(AWS2)       число дней после последнего снегопада
+      col 7 (H) - Ta(AWS2,d)     сумма температур со дня снегопада
     """
     try:
-        print(f"Загружаем альбедо (12h) из {excel_file}, лист '{sheet_name}'...")
+        print(f"Загружаем данные из {excel_file}, лист '{sheet_name}'...")
 
-        # Читаем файл, пропускаем первые 2 строки (заголовки)
-        # header=None чтобы прочитать все данные как есть
         df = pd.read_excel(excel_file, sheet_name=sheet_name, header=None, skiprows=2)
 
         print(f"  Формат файла: {df.shape[0]} строк, {df.shape[1]} колонок")
-        print(f"  Первые 5 строк:")
-        for i in range(min(5, len(df))):
-            print(f"    Строка {i}: {df.iloc[i, :3].values} ...")
 
-        # По описанию: колонка A (индекс 0) - дата, колонка D (индекс 3) - альбедо в 12h
-        # Но в вашем выводе видно, что альбедо находится в колонке с индексом 3
-
-        # Создаем DataFrame с правильными колонками
         df_albedo = pd.DataFrame()
+        df_albedo['date'] = pd.to_datetime(df.iloc[:, 0], errors='coerce')
+        df_albedo['albedo_12h'] = pd.to_numeric(df.iloc[:, 3], errors='coerce')
+        df_albedo['T2m_AWS2_d'] = pd.to_numeric(df.iloc[:, 4], errors='coerce')  # col E
+        df_albedo['nd_AWS2'] = pd.to_numeric(df.iloc[:, 6], errors='coerce')  # col G
+        df_albedo['Ta_AWS2_d'] = pd.to_numeric(df.iloc[:, 7], errors='coerce')  # col H
 
-        # Дата - первая колонка (индекс 0)
-        df_albedo['date'] = df.iloc[:, 0]
-
-        # Альбедо в 12h - четвертая колонка (индекс 3)
-        df_albedo['albedo_12h'] = df.iloc[:, 3]
-
-        # Преобразуем дату в datetime
-        df_albedo['date'] = pd.to_datetime(df_albedo['date'], errors='coerce')
-
-        # Преобразуем альбедо в числа (удаляем возможные текстовые значения)
-        df_albedo['albedo_12h'] = pd.to_numeric(df_albedo['albedo_12h'], errors='coerce')
-
-        # Удаляем строки с некорректной датой или NaN
-        initial_len = len(df_albedo)
+        # Удаляем строки без даты или альбедо
         df_albedo = df_albedo.dropna(subset=['date', 'albedo_12h'])
-
-        # Также удаляем строки, где альбедо > 1 (это явно не альбедо, а какие-то другие данные)
         df_albedo = df_albedo[df_albedo['albedo_12h'] <= 1.0]
-
-        print(f"  Удалено {initial_len - len(df_albedo)} строк с некорректными данными")
-
-        # Сортируем по дате
         df_albedo = df_albedo.sort_values('date').reset_index(drop=True)
 
-        print(f"✓ Загружено {len(df_albedo)} записей альбедо в 12h")
+        print(f"✓ Загружено {len(df_albedo)} записей")
         if len(df_albedo) > 0:
             print(f"  Диапазон дат: {df_albedo['date'].min().date()} - {df_albedo['date'].max().date()}")
             print(f"  Первые 5 записей:")
             for i in range(min(5, len(df_albedo))):
-                print(f"    {df_albedo.iloc[i]['date'].date()}: {df_albedo.iloc[i]['albedo_12h']:.3f}")
+                r = df_albedo.iloc[i]
+                print(f"    {r['date'].date()}: α={r['albedo_12h']:.3f}, "
+                      f"T2m={r['T2m_AWS2_d']:.2f}, nd={r['nd_AWS2']}, Ta={r['Ta_AWS2_d']:.2f}")
 
         return df_albedo
 
     except Exception as e:
-        print(f"✗ Ошибка загрузки альбедо: {e}")
+        print(f"✗ Ошибка загрузки albedo: {e}")
         import traceback
         traceback.print_exc()
         return pd.DataFrame()
 
+def get_daily_albedo_data(albedo_df, current_date):
+    """
+    Возвращает строку из albedo_df для заданной даты (объект date).
+    Если дата не найдена — возвращает None.
+    """
+    mask = albedo_df['date'].dt.date == current_date
+    if mask.any():
+        return albedo_df[mask].iloc[0]
+    return None
 
 def compute_daily_mean_temperatures(aws_df):
 
@@ -754,14 +746,18 @@ def run_glacier_model(config=CONFIG):
                 zsl = calculate_zsl(current_time, config["asl"], config["bsl"])
 
                 current_date = current_time.date()
-                t2m_mean_today = daily_mean_T2m.get(current_date, 0.0)
 
-                if sd == 1:
-                    nd_aws2 = 0
-                    ta_aws2 = 0.0
+                # Берём суточные данные из листа Albedo
+                daily_row = get_daily_albedo_data(albedo_df, current_date)
+
+                if daily_row is not None:
+                    t2m_mean_today = float(daily_row['T2m_AWS2_d'])  # col E
+                    nd_aws2 = int(daily_row['nd_AWS2'])  # col G
+                    ta_aws2 = float(daily_row['Ta_AWS2_d'])  # col H
                 else:
-                    nd_aws2 += 1
-                    ta_aws2 += t2m_mean_today  # сумма средних суточных T на AWS2
+                    # Если дата не найдена — fallback (не должно происходить)
+                    print(f"  ⚠ Нет данных Albedo для {current_date}, используем предыдущие значения")
+                    t2m_mean_today = 0.0
 
                 # Словарь: T2m и Ta для каждой точки на текущий день
                 daily_T2m_per_point = {}
@@ -769,15 +765,15 @@ def run_glacier_model(config=CONFIG):
                 for _, pt in points_gdf.iterrows():
                     z_pt = pt['z']
                     dz = z_pt - config["z_aws2"]
-                    # Средняя суточная T в ячейке
+                    # T2m(z,d) = T2m(AWS2,d) + kt*(z - z_aws2)
                     T2m_daily = t2m_mean_today + config["kt"] * dz
-                    # Сумма температур со дня снегопада в ячейке
+                    # Ta(z,d)  = Ta(AWS2,d) + (nd(AWS2)+1) * kt * (z - z_aws2)
                     Ta_daily = ta_aws2 + (nd_aws2 + 1) * config["kt"] * dz
                     daily_T2m_per_point[int(pt['cat'])] = T2m_daily
                     daily_Ta_per_point[int(pt['cat'])] = Ta_daily
 
                 print(f"  SD={sd}, Z_sl={zsl:.1f} м, nd_aws2={nd_aws2}, "
-                      f"Ta_aws2={ta_aws2:.2f} °C·дней, T2m_AWS2_mean={t2m_mean_today:.2f}")
+                      f"Ta_aws2={ta_aws2:.2f}, T2m_AWS2_d={t2m_mean_today:.2f}")
 
             # SD сохраняется на весь день
 
