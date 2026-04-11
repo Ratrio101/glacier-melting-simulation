@@ -737,6 +737,8 @@ def run_glacier_model(config=CONFIG):
         #  ГЛАВНЫЙ ЦИКЛ
         # ========================================
         prev_day = -1
+        daily_T2m_per_point = {}
+        daily_Ta_per_point = {}
         sd = 0  # начальное значение SD
         zsl = config["bsl"]  # начальное значение Z_sl
         nd_aws2 = 0  # число дней после последнего снегопада на AWS2
@@ -748,24 +750,34 @@ def run_glacier_model(config=CONFIG):
             # Вычисляем SD для текущего дня (один раз в начале дня)
             # SD одинаков для всех ячеек в данный день
             if current_time.hour == 0 and current_time.minute == 0:
-                # В начале каждого дня пересчитываем SD и zsl
                 sd = calculate_sd(albedo_df, current_time, alpha_d=0.06)
                 zsl = calculate_zsl(current_time, config["asl"], config["bsl"])
-                # Получаем среднюю температуру для текущего дня (используем дату без времени)
+
                 current_date = current_time.date()
                 t2m_mean_today = daily_mean_T2m.get(current_date, 0.0)
 
-                # Обновляем nd_aws2 и ta_aws2 в зависимости от SD
                 if sd == 1:
-                    # Снегопад: сбрасываем счетчик и сумму температур
                     nd_aws2 = 0
                     ta_aws2 = 0.0
                 else:
-                    # Нет снегопада: увеличиваем счетчик и добавляем температуру
                     nd_aws2 += 1
-                    ta_aws2 += t2m_mean_today
+                    ta_aws2 += t2m_mean_today  # сумма средних суточных T на AWS2
 
-                print(f"  SD={sd}, Z_sl={zsl:.1f} м, nd_aws2={nd_aws2}, Ta_aws2={ta_aws2:.2f} °C·дней")
+                # Словарь: T2m и Ta для каждой точки на текущий день
+                daily_T2m_per_point = {}
+                daily_Ta_per_point = {}
+                for _, pt in points_gdf.iterrows():
+                    z_pt = pt['z']
+                    dz = z_pt - config["z_aws2"]
+                    # Средняя суточная T в ячейке
+                    T2m_daily = t2m_mean_today + config["kt"] * dz
+                    # Сумма температур со дня снегопада в ячейке
+                    Ta_daily = ta_aws2 + (nd_aws2 + 1) * config["kt"] * dz
+                    daily_T2m_per_point[int(pt['cat'])] = T2m_daily
+                    daily_Ta_per_point[int(pt['cat'])] = Ta_daily
+
+                print(f"  SD={sd}, Z_sl={zsl:.1f} м, nd_aws2={nd_aws2}, "
+                      f"Ta_aws2={ta_aws2:.2f} °C·дней, T2m_AWS2_mean={t2m_mean_today:.2f}")
 
             # SD сохраняется на весь день
 
@@ -805,7 +817,7 @@ def run_glacier_model(config=CONFIG):
                 Sin_cell = compute_Sin_cell(aws_data['Sin_AWS2'], G_cell, G_AWS2)
 
                 # Температура
-                T2m_pt = compute_T2m_at_z(aws_data['T2m_AWS2'], config["kt"], z, config["z_aws2"])
+                T2m_pt  = daily_T2m_per_point.get(cat, 0.0)   # средняя суточная T в ячейке
 
                 # Тип поверхности
                 if sd == 1 or z >= zsl:
@@ -813,10 +825,7 @@ def run_glacier_model(config=CONFIG):
                 else:
                     ST = 0  # лед
 
-                # Расчет Ta (сумма температур со дня снегопада) для данной ячейки
-                # Формула: Ta(z,d) = Ta(AWS2,d) + (nd(AWS2)+1) * kt * (z - z(AWS2))
-                dz = z - config["z_aws2"]
-                Ta_cell = ta_aws2 + (nd_aws2 + 1) * config["kt"] * dz
+                Ta_cell = daily_Ta_per_point.get(cat, 0.0)
 
                 # Альбедо (теперь используем Ta_cell вместо константы 50)
                 alpha = compute_albedo(ST, T2m_pt, Ta_cell, config["kSS"],
