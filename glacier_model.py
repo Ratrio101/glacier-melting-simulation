@@ -393,15 +393,25 @@ def compute_Sout(alpha, Sin):
     return alpha * Sin
 
 
-def compute_Lout(epsilon, sigma, ST, Qm):
-    """Длинноволновое излучение поверхности"""
+def compute_Lout(epsilon, sigma, ST, Qm, T2m_cell_C):
+    """
+    Lout = ε · σ · Ts⁴
+
+    При Qm > 0  →  Ts = 273.15 K  (таяние, 0 °C)
+    При Qm ≤ 0  →  Ts = min(T2m, 0 °C) в Кельвинах
+                   (поверхность не теплее воздуха и не теплее 0 °C)
+    """
     if Qm > 0:
-        Ts_K = 273.15  # таяние — 0°C
+        Ts_K = 273.15
     else:
-        Ts_K = 271.15 if ST == 1 else 272.15
+        # Поверхность не может быть теплее 0 °C без таяния
+        # и не теплее воздуха
+        Ts_C = min(T2m_cell_C, 0.0)
+        Ts_K = Ts_C + 273.15
 
     Lout = epsilon * sigma * (Ts_K ** 4)
-    return Lout, Ts_K - 273.15
+    Ts_C_out = Ts_K - 273.15
+    return Lout, Ts_C_out
 
 
 def compute_Rnet(Sin, Sout, Lin, Lout):
@@ -895,7 +905,7 @@ def run_glacier_model(config=CONFIG):
                 Lin = aws_data['Lin_AWS2']
 
                 # Итерация 1
-                Lout_1, Ts_1 = compute_Lout(config["epsilon"], config["sigma"], ST, 0)
+                Lout_1, Ts_1 = compute_Lout(config["epsilon"], config["sigma"], ST, 0, T2m_pt)
                 H_1, LE_1 = compute_turbulent_heat(T2m_pt, Ts_1, aws_data['wind_speed'],
                                                    aws_data['pressure'], aws_data['RH_AWS2'], z)
                 Qr_1 = compute_rain_heat(T2m_pt, Ts_1, aws_data['precipitation'])
@@ -903,7 +913,7 @@ def run_glacier_model(config=CONFIG):
                 Qm_1 = compute_melting_heat(Sin_cell, Sout, Lin, Lout_1, H_1, LE_1, Qr_1, Qg_1)
 
                 # Итерация 2
-                Lout, Ts = compute_Lout(config["epsilon"], config["sigma"], ST, Qm_1)
+                Lout, Ts = compute_Lout(config["epsilon"], config["sigma"], ST, Qm_1, T2m_pt)
                 H, LE = compute_turbulent_heat(T2m_pt, Ts, aws_data['wind_speed'],
                                                aws_data['pressure'], aws_data['RH_AWS2'], z)
                 Qr = compute_rain_heat(T2m_pt, Ts, aws_data['precipitation'])
