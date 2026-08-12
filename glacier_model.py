@@ -82,8 +82,8 @@ CONFIG = {
     "glacier_shp": "glacier.shp",           # shape-файл ледника
     "output_dir": "output_model",           # выходная модель (директория)
     "time_step_minutes": 30,                # шаг вычислений
-    "period_start": "2019-07-30T00:00:00",  # начальный период времени
-    "period_end": "2019-07-30T23:30:00",    # конечный период времени
+    "period_start": "2019-07-07T00:00:00",  # начальный период времени
+    "period_end": "2019-08-31T23:30:00",    # конечный период времени
 
     # r.sun параметры
     "linke_value": 3.0,                     # коэффициент Линке = 3
@@ -113,6 +113,67 @@ CONFIG = {
 
 def ensure_dir(d):
     os.makedirs(d, exist_ok=True)
+
+def ask_period_from_user(config):
+    """
+    Запрашивает у пользователя начальную и конечную дату моделирования.
+    Формат: YYYY-MM-DDTHH:MM:SS  (например, 2019-07-30T00:00:00)
+    """
+    fmt = "%Y-%m-%dT%H:%M:%S"
+    prompt_start = (
+        f"Введите НАЧАЛО периода (формат: ГГГГ-ММ-ДДTчч:мм:сс)\n"
+        f"  [Enter — оставить по умолчанию: {config['period_start']}]: "
+    )
+    prompt_end = (
+        f"Введите КОНЕЦ периода (формат: ГГГГ-ММ-ДДTчч:мм:сс)\n"
+        f"  [Enter — оставить по умолчанию: {config['period_end']}]: "
+    )
+
+    # --- Начало ---
+    while True:
+        raw = input(prompt_start).strip()
+        if raw == "":
+            start_dt = pd.to_datetime(config["period_start"])
+            break
+        try:
+            start_dt = dt.datetime.strptime(raw, fmt)
+            break
+        except ValueError:
+            print("  ✗ Неверный формат. Пример: 2019-07-30T00:00:00")
+
+    # --- Конец ---
+    while True:
+        raw = input(prompt_end).strip()
+        if raw == "":
+            end_dt = pd.to_datetime(config["period_end"])
+            break
+        try:
+            end_dt = dt.datetime.strptime(raw, fmt)
+            break
+        except ValueError:
+            print("  ✗ Неверный формат. Пример: 2019-08-31T23:30:00")
+
+    # --- Валидация: конец > начало ---
+    if end_dt <= start_dt:
+        print("  ⚠ Конец раньше/равен началу. Меняю местами.")
+        start_dt, end_dt = end_dt, start_dt
+
+    # --- Записываем обратно в config ---
+    config["period_start"] = start_dt.strftime(fmt)
+    config["period_end"]   = end_dt.strftime(fmt)
+
+    # --- Информационное сообщение ---
+    step_min = config["time_step_minutes"]
+    total_minutes = int((end_dt - start_dt).total_seconds() / 60)
+    n_steps = total_minutes // step_min + 1
+    n_days  = (end_dt.date() - start_dt.date()).days + 1
+
+    print(f"\n  Период: {config['period_start']}  →  {config['period_end']}")
+    print(f"  Дней: {n_days} | Шагов по {step_min} мин: {n_steps}")
+    print(f"  Точек на леднике: ~100")
+    print(f"  Итого строк в выходном файле: ~{n_steps * 100}\n")
+
+    return config
 
 # Алгоритм определения солнечного времени для расчета радиации r.sun
 def get_solar_time_for_rsun(datetime_obj, longitude, timezone_offset):
@@ -940,4 +1001,5 @@ def run_glacier_model(config=CONFIG):
 
 # ЗАПУСК МОДЕЛИ
 if __name__ == "__main__":
-    run_glacier_model()
+    CONFIG = ask_period_from_user(CONFIG)  # запрашиваем даты
+    run_glacier_model(CONFIG)              # запускаем программу

@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 
+# Модули и библиотеки, необходимые для работы программы
 import os
 import sys
 import math
@@ -12,14 +13,17 @@ import geopandas as gpd
 import rasterio
 
 # ===== НАСТРОЙКА GRASS GIS =====
-grass_base = r"C:\GRASS"
+grass_base = r"C:\GRASS" # база GRASS GIS
 
+# Проверка на наличие базы GRASS GIS
 if not os.path.exists(grass_base):
     print(f"✗ GRASS не найден в {grass_base}")
     sys.exit(1)
 
+# Добавление системной переменной в среду
 os.environ['GISBASE'] = grass_base
 
+# Присоединение каталогов (путей)
 grass_bin = os.path.join(grass_base, "bin")
 grass_lib = os.path.join(grass_base, "lib")
 grass_scripts = os.path.join(grass_base, "scripts")
@@ -42,6 +46,7 @@ os.environ['GRASSBIN'] = os.path.join(grass_base, "grass78.bat")
 os.environ['GRASS_PYTHON'] = sys.executable
 os.environ['GRASS_SH'] = os.path.join(grass_base, "msys", "bin", "sh.exe")
 
+# Запуск сессии GRASS GIS
 try:
     import grass.script as gs
     import grass.script.setup as gsetup
@@ -60,55 +65,56 @@ except ImportError:
     sys.exit(1)
 
 # ===== ПУТИ К ДАННЫМ =====
-GRASS_DB = r"C:\GRASS\grassdata"
-LOCATION = "glacier_TEST"
-MAPSET = "PERMANENT"
+GRASS_DB = r"C:\GRASS\grassdata" # база данных GRASS
+LOCATION = "glacier_TEST" # локация GRASS
+MAPSET = "PERMANENT" # набор карт GRASS
 
 os.makedirs(GRASS_DB, exist_ok=True)
 
-# ---------------------------
-# ========== CONFIG =========
-# ---------------------------
+# ---------------------------------------------------
+# ========== CONFIG - постоянные переменные =========
+# ---------------------------------------------------
 CONFIG = {
-    "dem_tif": "DEM.tif",
-    "elevation_tif": "elevation.tif",
-    "slope_tif": "slope.tif",
-    "aspect_tif": "aspect.tif",
-    "glacier_shp": "glacier.shp",
-    "output_dir": "output_model",
-    "time_step_minutes": 30,
-    "period_start": "2019-07-07T00:00:00",
-    "period_end": "2019-08-31T23:30:00",
+    "dem_tif": "DEM.tif",                   # маска ледника
+    "elevation_tif": "elevation.tif",       # высота
+    "slope_tif": "slope.tif",               # уклон
+    "aspect_tif": "aspect.tif",             # направление уклона (азимут)
+    "glacier_shp": "glacier.shp",           # shape-файл ледника
+    "output_dir": "output_model",           # выходная модель (директория)
+    "time_step_minutes": 30,                # шаг вычислений
+    "period_start": "2019-07-30T00:00:00",  # начальный период времени
+    "period_end": "2019-07-30T23:30:00",    # конечный период времени
 
     # r.sun параметры
-    "linke_value": 3.0,  # коэффициент Линке
-    "albedo_value": 0.2,  # альбедо для r.sun
+    "linke_value": 3.0,                     # коэффициент Линке = 3
+    "albedo_value": 0.2,                    # альбедо для расчета r.sun = 0.2
 
     # Физические константы
-    "kt": -0.0065,
-    "asl": 1.7813,
-    "bsl": 2067.6,
-    "kSS": 0.33745,
-    "kT2m": 0.00838,
-    "kTa": -0.00112,
-    "c_alpha": 0.13469,
-    "rho_ice": 784,
-    "rho_snow": 602,
-    "sigma": 5.670374419e-8,
-    "epsilon": 1,
-    "z_aws1": 2536,
-    "z_aws2": 2549,
-    "L_fs": 330000,
-    "L_fi": 335000,
-    "latitude": 56.82,
-    "longitude": 117.33,
-    "timezone": 9
+    "kt": -0.0065,                          # вертикальный градиент температуры воздуха
+    "asl": 1.7813,                          # коэффициент линейной регрессии в формуле расчета высоты снеговой линии
+    "bsl": 2067.6,                          # коэффициент линейной регрессии в формуле расчета высоты снеговой линии
+    "kSS": 0.33745,                         # коэффициент линейной регрессии в формуле расчета альбедо α
+    "kT2m": 0.00838,                        # коэффициент линейной регрессии в формуле расчета альбедо α
+    "kTa": -0.00112,                        # коэффициент линейной регрессии в формуле расчета альбедо α
+    "c_alpha": 0.13469,                     # коэффициент линейной регрессии в формуле расчета альбедо α
+    "rho_ice": 784,                         # средняя плотность льда
+    "rho_snow": 602,                        # средняя плотность снега
+    "sigma": 5.670374419e-8,                # постоянная Стефана-Больцмана
+    "epsilon": 1,                           # излучательная способность поверхности
+    "z_aws1": 2536,                         # высота метеостанции на морене
+    "z_aws2": 2549,                         # высота метеостанции на леднике
+    "L_fs": 330000,                         # скрытая теплота плавления снега
+    "L_fi": 335000,                         # скрытая теплота плавления льда
+    "latitude": 56.82,                      # широта
+    "longitude": 117.33,                    # долгота
+    "timezone": 9                           # часовой пояс
 }
 
 
 def ensure_dir(d):
     os.makedirs(d, exist_ok=True)
 
+# Алгоритм определения солнечного времени для расчета радиации r.sun
 def get_solar_time_for_rsun(datetime_obj, longitude, timezone_offset):
 
     day_of_year = datetime_obj.timetuple().tm_yday
@@ -133,6 +139,7 @@ def get_solar_time_for_rsun(datetime_obj, longitude, timezone_offset):
 
     return solar_time
 
+# Вычисление карт горизонта с использованием GRASS
 def prepare_horizon_maps():
 
     print("Вычисляем карты горизонта (это может занять время)...")
@@ -152,6 +159,7 @@ def prepare_horizon_maps():
         print(f"⚠ Ошибка создания horizon: {e}")
         return False
 
+# Расчет r.sun с использованием GRASS
 def run_rsun_for_timestep(day_of_year, local_time, output_suffix, use_horizon=False):
 
     if local_time < 0 or local_time >= 24:
@@ -185,6 +193,7 @@ def run_rsun_for_timestep(day_of_year, local_time, output_suffix, use_horizon=Fa
         print(f"⚠ r.sun ошибка: {e}")
         return None, None
 
+# Алгоритм извлечения растровых значений по точкам с использованием GRASS
 def extract_raster_values_at_points(raster_name, points_gdf):
     coords = []
     cats = []
@@ -227,7 +236,7 @@ def extract_raster_values_at_points(raster_name, points_gdf):
 
     return G_values
 
-
+# Очистка временных растров
 def cleanup_temp_rasters(raster_list):
     """Удаляет временные растры"""
     for name in raster_list:
@@ -237,6 +246,7 @@ def cleanup_temp_rasters(raster_list):
         except:
             pass
 
+# Расчет приходящей радиации по ячейкам
 def compute_Sin_cell(Sin_AWS2, G_cell, G_AWS2):
     if G_cell <= 0 or Sin_AWS2 <= 0:
         return 0.0
@@ -245,6 +255,66 @@ def compute_Sin_cell(Sin_AWS2, G_cell, G_AWS2):
         return 0.0
 
     return Sin_AWS2 * (G_cell / G_AWS2)
+
+# Алгоритм определения дня со снегопадом
+def calculate_sd(albedo_df, current_date, alpha_d=0.06):
+    """
+    Рассчитывает SD (день со снегопадом) для заданной даты
+
+    SD(d) = 1 если [α(12h,d) - α(12h,d-1)] >= α_d (0.06)
+    SD(d) = 0 если разность меньше α_d
+    """
+    # Приводим current_date к началу дня (без времени)
+    current_day = current_date.replace(hour=0, minute=0, second=0, microsecond=0)
+
+    # Проверка на пустой DataFrame
+    if albedo_df.empty:
+        print(f"  ⚠ albedo_df пуст, SD = 0 для {current_day.date()}")
+        return 0
+
+    # Ищем альбедо для текущего дня в 12 часов
+    current_mask = albedo_df['date'].dt.date == current_day.date()
+    current_albedo = albedo_df[current_mask]['albedo_12h']
+
+    # Ищем альбедо для предыдущего дня
+    prev_day = current_day - dt.timedelta(days=1)
+    prev_mask = albedo_df['date'].dt.date == prev_day.date()
+    prev_albedo = albedo_df[prev_mask]['albedo_12h']
+
+    # Если данных нет для текущего или предыдущего дня
+    if len(current_albedo) == 0:
+        print(f"  ⚠ Нет данных альбедо для {current_day.date()}, SD = 0")
+        return 0
+
+    alpha_current = float(current_albedo.iloc[0])
+
+    if len(prev_albedo) == 0:
+        print(f"  ⚠ Нет данных альбедо для {prev_day.date()}, SD = 0 (первый день моделирования)")
+        print(f"     {current_day.date()}: α_curr={alpha_current:.3f}, нет данных за предыдущий день")
+        return 0
+
+    alpha_prev = float(prev_albedo.iloc[0])
+    alpha_diff = alpha_current - alpha_prev
+
+    # Формула из документации
+    if alpha_diff >= alpha_d:
+        print(
+            f"  {current_day.date()}: α_curr={alpha_current:.3f}, α_prev={alpha_prev:.3f}, diff={alpha_diff:.3f} >= {alpha_d} → SD=1 (снегопад)")
+        return 1
+    else:
+        print(
+            f"  {current_day.date()}: α_curr={alpha_current:.3f}, α_prev={alpha_prev:.3f}, diff={alpha_diff:.3f} < {alpha_d} → SD=0 (нет снегопада)")
+        return 0
+
+# Расчет высоты снеговой линии (по формуле регрессии)
+def calculate_zsl(current_date, asl, bsl):
+    # Получаем порядковый день года (1-365)
+    day_of_year = current_date.timetuple().tm_yday
+
+    # Рассчитываем Z_sl по формуле линейной регрессии
+    zsl = asl * day_of_year + bsl
+
+    return zsl
 
 def compute_T2m_at_z(T2m_aws2, kt, z_cell, z_aws2):
     """Температура воздуха на высоте"""
@@ -514,6 +584,72 @@ def get_aws_at_time(aws_df, target_datetime):
         'pressure': 750.0, 'precipitation': 0.0, 'alpha_AWS2': 0.5
     }
 
+
+def load_albedo_from_excel(excel_file="Test_model.xlsx", sheet_name="Albedo"):
+    """
+    Загружает суточные данные из листа Albedo:
+      col 0 (A) - дата
+      col 3 (D) - альбедо в 12h  (для расчёта SD)
+      col 4 (E) - T2m(AWS2,d)    средняя суточная температура
+      col 6 (G) - nd(AWS2)       число дней после последнего снегопада
+      col 7 (H) - Ta(AWS2,d)     сумма температур со дня снегопада
+    """
+    try:
+        print(f"Загружаем данные из {excel_file}, лист '{sheet_name}'...")
+
+        df = pd.read_excel(excel_file, sheet_name=sheet_name, header=None, skiprows=2)
+
+        print(f"  Формат файла: {df.shape[0]} строк, {df.shape[1]} колонок")
+
+        df_albedo = pd.DataFrame()
+        df_albedo['date'] = pd.to_datetime(df.iloc[:, 0], errors='coerce')
+        df_albedo['albedo_12h'] = pd.to_numeric(df.iloc[:, 3], errors='coerce')
+        df_albedo['T2m_AWS2_d'] = pd.to_numeric(df.iloc[:, 4], errors='coerce')  # col E
+        df_albedo['nd_AWS2'] = pd.to_numeric(df.iloc[:, 6], errors='coerce')  # col G
+        df_albedo['Ta_AWS2_d'] = pd.to_numeric(df.iloc[:, 7], errors='coerce')  # col H
+
+        # Удаляем строки без даты или альбедо
+        df_albedo = df_albedo.dropna(subset=['date', 'albedo_12h'])
+        df_albedo = df_albedo[df_albedo['albedo_12h'] <= 1.0]
+        df_albedo = df_albedo.sort_values('date').reset_index(drop=True)
+
+        print(f"✓ Загружено {len(df_albedo)} записей")
+        if len(df_albedo) > 0:
+            print(f"  Диапазон дат: {df_albedo['date'].min().date()} - {df_albedo['date'].max().date()}")
+            print(f"  Первые 5 записей:")
+            for i in range(min(5, len(df_albedo))):
+                r = df_albedo.iloc[i]
+                print(f"    {r['date'].date()}: α={r['albedo_12h']:.3f}, "
+                      f"T2m={r['T2m_AWS2_d']:.2f}, nd={r['nd_AWS2']}, Ta={r['Ta_AWS2_d']:.2f}")
+
+        return df_albedo
+
+    except Exception as e:
+        print(f"✗ Ошибка загрузки albedo: {e}")
+        import traceback
+        traceback.print_exc()
+        return pd.DataFrame()
+
+def get_daily_albedo_data(albedo_df, current_date):
+    """
+    Возвращает строку из albedo_df для заданной даты (объект date).
+    Если дата не найдена — возвращает None.
+    """
+    mask = albedo_df['date'].dt.date == current_date
+    if mask.any():
+        return albedo_df[mask].iloc[0]
+    return None
+
+def compute_daily_mean_temperatures(aws_df):
+
+    # Создаем копию, чтобы не изменять исходный DataFrame
+    df_temp = aws_df.copy()
+    # Извлекаем дату из datetime
+    df_temp['date'] = df_temp['datetime'].dt.date
+    # Группируем по дате и вычисляем среднюю температуру
+    daily_mean = df_temp.groupby('date')['T2m_AWS2'].mean().to_dict()
+    return daily_mean
+
 #  ГЛАВНАЯ ФУНКЦИЯ
 
 def run_glacier_model(config=CONFIG):
@@ -528,6 +664,20 @@ def run_glacier_model(config=CONFIG):
     if aws_df.empty:
         print("✗ Нет метеоданных!")
         return
+
+    # Вычисляем среднесуточные температуры на AWS2
+    daily_mean_T2m = compute_daily_mean_temperatures(aws_df)
+    print(f"✓ Загружены среднесуточные температуры для {len(daily_mean_T2m)} дней")
+
+    albedo_df = load_albedo_from_excel()
+    if albedo_df.empty:
+        print("⚠ Внимание: не удалось загрузить альбедо для расчета SD!")
+        print("  SD будет всегда = 0")
+    else:
+        # Выводим все даты и значения для проверки
+        print("\n=== ДАННЫЕ АЛЬБЕДО (12h) ===")
+        for idx, row in albedo_df.iterrows():
+            print(f"  {row['date'].date()}: {row['albedo_12h']:.3f}")
 
     # 2. Точки
     points_gdf = create_research_points(config["dem_tif"], config["glacier_shp"])
@@ -579,9 +729,53 @@ def run_glacier_model(config=CONFIG):
         #  ГЛАВНЫЙ ЦИКЛ
         # ========================================
         prev_day = -1
+        daily_T2m_per_point = {}
+        daily_Ta_per_point = {}
+        sd = 0  # начальное значение SD
+        zsl = config["bsl"]  # начальное значение Z_sl
+        nd_aws2 = 0  # число дней после последнего снегопада на AWS2
+        ta_aws2 = 0.0  # сумма температур на AWS2 после последнего снегопада
 
         for step_i, current_time in enumerate(all_times):
             day_of_year = current_time.timetuple().tm_yday
+
+            # Вычисляем SD для текущего дня (один раз в начале дня)
+            # SD одинаков для всех ячеек в данный день
+            if current_time.hour == 0 and current_time.minute == 0:
+                sd = calculate_sd(albedo_df, current_time, alpha_d=0.06)
+                zsl = calculate_zsl(current_time, config["asl"], config["bsl"])
+
+                current_date = current_time.date()
+
+                # Берём суточные данные из листа Albedo
+                daily_row = get_daily_albedo_data(albedo_df, current_date)
+
+                if daily_row is not None:
+                    t2m_mean_today = float(daily_row['T2m_AWS2_d'])  # col E
+                    nd_aws2 = int(daily_row['nd_AWS2'])  # col G
+                    ta_aws2 = float(daily_row['Ta_AWS2_d'])  # col H
+                else:
+                    # Если дата не найдена — fallback (не должно происходить)
+                    print(f"  ⚠ Нет данных Albedo для {current_date}, используем предыдущие значения")
+                    t2m_mean_today = 0.0
+
+                # Словарь: T2m и Ta для каждой точки на текущий день
+                daily_T2m_per_point = {}
+                daily_Ta_per_point = {}
+                for _, pt in points_gdf.iterrows():
+                    z_pt = pt['z']
+                    dz = z_pt - config["z_aws2"]
+                    # T2m(z,d) = T2m(AWS2,d) + kt*(z - z_aws2)
+                    T2m_daily = t2m_mean_today + config["kt"] * dz
+                    # Ta(z,d)  = Ta(AWS2,d) + (nd(AWS2)+1) * kt * (z - z_aws2)
+                    Ta_daily = ta_aws2 + (nd_aws2 + 1) * config["kt"] * dz
+                    daily_T2m_per_point[int(pt['cat'])] = T2m_daily
+                    daily_Ta_per_point[int(pt['cat'])] = Ta_daily
+
+                print(f"  SD={sd}, Z_sl={zsl:.1f} м, nd_aws2={nd_aws2}, "
+                      f"Ta_aws2={ta_aws2:.2f}, T2m_AWS2_d={t2m_mean_today:.2f}")
+
+            # SD сохраняется на весь день
 
             if current_time.day != prev_day:
                 prev_day = current_time.day
@@ -619,14 +813,18 @@ def run_glacier_model(config=CONFIG):
                 Sin_cell = compute_Sin_cell(aws_data['Sin_AWS2'], G_cell, G_AWS2)
 
                 # Температура
-                T2m_pt = compute_T2m_at_z(aws_data['T2m_AWS2'], config["kt"], z, config["z_aws2"])
+                T2m_pt  = daily_T2m_per_point.get(cat, 0.0)   # средняя суточная T в ячейке
 
                 # Тип поверхности
-                ST = 1 if z > config["bsl"] else 0
+                if sd == 1 or z >= zsl:
+                    ST = 1  # снег
+                else:
+                    ST = 0  # лед
 
-                # Альбедо
-                Ta = 50
-                alpha = compute_albedo(ST, T2m_pt, Ta, config["kSS"],
+                Ta_cell = daily_Ta_per_point.get(cat, 0.0)
+
+                # Альбедо (теперь используем Ta_cell вместо константы 50)
+                alpha = compute_albedo(ST, T2m_pt, Ta_cell, config["kSS"],
                                        config["kT2m"], config["kTa"], config["c_alpha"])
 
                 # Sout
@@ -661,6 +859,11 @@ def run_glacier_model(config=CONFIG):
                     'cat': cat,
                     'z': z,
                     'ST': ST,
+                    'SD': sd,
+                    'Z_sl': round(zsl, 1),
+                    'nd_aws2': nd_aws2,  # число дней после снегопада на AWS2
+                    'Ta_aws2': round(ta_aws2, 2),  # сумма температур на AWS2
+                    'Ta_cell': round(Ta_cell, 2),  # сумма температур в ячейке
                     'G_rsun': round(G_cell, 2),
                     'G_AWS2_rsun': round(G_AWS2, 2),
                     'Sin_AWS2': round(aws_data['Sin_AWS2'], 2),
@@ -735,5 +938,6 @@ def run_glacier_model(config=CONFIG):
     print(f"Абляция: {results_df['ablation_mm'].sum():.2f} мм")
     print("\n✓ ГОТОВО!")
 
+# ЗАПУСК МОДЕЛИ
 if __name__ == "__main__":
     run_glacier_model()
