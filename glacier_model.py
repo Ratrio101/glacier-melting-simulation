@@ -381,17 +381,30 @@ def compute_T2m_at_z(T2m_aws2, kt, z_cell, z_aws2):
     """Температура воздуха на высоте"""
     return T2m_aws2 + kt * (z_cell - z_aws2)
 
-
 def compute_albedo(ST, T2m, Ta, k_ST, k_T2m, k_Ta, c_alpha):
     """Альбедо поверхности"""
     albedo = k_ST * ST + k_T2m * T2m + k_Ta * Ta + c_alpha
     return max(0.1, min(0.9, albedo))
 
+def compute_T2m_instant(T2m_aws2_instant, kt, z_cell, z_aws2):
+    """
+    Формула 11: T2m(z, t) = T2m(AWS2, t) + kt * (z - z_aws2)
+    Мгновенная (каждые 30 мин) температура воздуха в ячейке.
+    """
+    return T2m_aws2_instant + kt * (z_cell - z_aws2)
 
 def compute_Sout(alpha, Sin):
     """Отражённая радиация"""
     return alpha * Sin
 
+def compute_layer_mean_temperature(T2m_aws, z_aws, z_cell, kt):
+    """
+    Средняя температура слоя воздуха между метеостанцией и ячейкой.
+    Линейная интерполяция по вертикальному градиенту.
+
+    T_mean = T2m_aws + kt * (z_cell - z_aws) / 2
+    """
+    return T2m_aws + kt * (z_cell - z_aws) / 2.0
 
 def compute_Lout(epsilon, sigma, ST, Qm, T2m_cell_C):
     """
@@ -883,6 +896,9 @@ def run_glacier_model(config=CONFIG):
                 # Sin
                 Sin_cell = compute_Sin_cell(aws_data['Sin_AWS2'], G_cell, G_AWS2)
 
+                # мгновенная температура T2m в ячейке
+                T2m_inst = aws_data['T2m_AWS2'] + config["kt"] * (z - config["z_aws2"])
+
                 # Температура
                 T2m_pt  = daily_T2m_per_point.get(cat, 0.0)   # средняя суточная T в ячейке
 
@@ -947,7 +963,8 @@ def run_glacier_model(config=CONFIG):
                     'Lnet': round(Lnet, 2),
                     'Rnet': round(Rnet, 2),
                     'T2m_AWS2': round(aws_data['T2m_AWS2'], 2),
-                    'T2m': round(T2m_pt, 2),
+                    'T2m': round(T2m_pt, 2), # для расчета альбедо
+                    'T2m_inst': round(T2m_inst, 2),  # температура в ячейке по времени (для расчета ост. показателей)
                     'Ts': round(Ts, 2),
                     'wind_speed': round(aws_data['wind_speed'], 2),
                     'RH': round(aws_data['RH_AWS2'], 2),

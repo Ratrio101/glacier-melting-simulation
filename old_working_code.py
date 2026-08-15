@@ -381,27 +381,50 @@ def compute_T2m_at_z(T2m_aws2, kt, z_cell, z_aws2):
     """Температура воздуха на высоте"""
     return T2m_aws2 + kt * (z_cell - z_aws2)
 
-
 def compute_albedo(ST, T2m, Ta, k_ST, k_T2m, k_Ta, c_alpha):
     """Альбедо поверхности"""
     albedo = k_ST * ST + k_T2m * T2m + k_Ta * Ta + c_alpha
     return max(0.1, min(0.9, albedo))
 
+def compute_T2m_instant(T2m_aws2_instant, kt, z_cell, z_aws2):
+    """
+    Формула 11: T2m(z, t) = T2m(AWS2, t) + kt * (z - z_aws2)
+    Мгновенная (каждые 30 мин) температура воздуха в ячейке.
+    """
+    return T2m_aws2_instant + kt * (z_cell - z_aws2)
 
 def compute_Sout(alpha, Sin):
     """Отражённая радиация"""
     return alpha * Sin
 
+def compute_layer_mean_temperature(T2m_aws, z_aws, z_cell, kt):
+    """
+    Средняя температура слоя воздуха между метеостанцией и ячейкой.
+    Линейная интерполяция по вертикальному градиенту.
 
-def compute_Lout(epsilon, sigma, ST, Qm):
-    """Длинноволновое излучение поверхности"""
+    T_mean = T2m_aws + kt * (z_cell - z_aws) / 2
+    """
+    return T2m_aws + kt * (z_cell - z_aws) / 2.0
+
+def compute_Lout(epsilon, sigma, ST, Qm, T2m_cell_C):
+    """
+    Lout = ε · σ · Ts⁴
+
+    При Qm > 0  →  Ts = 273.15 K  (таяние, 0 °C)
+    При Qm ≤ 0  →  Ts = min(T2m, 0 °C) в Кельвинах
+                   (поверхность не теплее воздуха и не теплее 0 °C)
+    """
     if Qm > 0:
-        Ts_K = 273.15  # таяние — 0°C
+        Ts_K = 273.15
     else:
-        Ts_K = 271.15 if ST == 1 else 272.15
+        # Поверхность не может быть теплее 0 °C без таяния
+        # и не теплее воздуха
+        Ts_C = min(T2m_cell_C, 0.0)
+        Ts_K = Ts_C + 273.15
 
     Lout = epsilon * sigma * (Ts_K ** 4)
-    return Lout, Ts_K - 273.15
+    Ts_C_out = Ts_K - 273.15
+    return Lout, Ts_C_out
 
 
 def compute_Rnet(Sin, Sout, Lin, Lout):
@@ -873,6 +896,9 @@ def run_glacier_model(config=CONFIG):
                 # Sin
                 Sin_cell = compute_Sin_cell(aws_data['Sin_AWS2'], G_cell, G_AWS2)
 
+                # мгновенная температура T2m в ячейке
+                T2m_inst = aws_data['T2m_AWS2'] + config["kt"] * (z - config["z_aws2"])
+
                 # Температура
                 T2m_pt  = daily_T2m_per_point.get(cat, 0.0)   # средняя суточная T в ячейке
 
@@ -895,7 +921,7 @@ def run_glacier_model(config=CONFIG):
                 Lin = aws_data['Lin_AWS2']
 
                 # Итерация 1
-                Lout_1, Ts_1 = compute_Lout(config["epsilon"], config["sigma"], ST, 0)
+                Lout_1, Ts_1 = compute_Lout(config["epsilon"], config["sigma"], ST, 0, T2m_pt)
                 H_1, LE_1 = compute_turbulent_heat(T2m_pt, Ts_1, aws_data['wind_speed'],
                                                    aws_data['pressure'], aws_data['RH_AWS2'], z)
                 Qr_1 = compute_rain_heat(T2m_pt, Ts_1, aws_data['precipitation'])
@@ -903,7 +929,7 @@ def run_glacier_model(config=CONFIG):
                 Qm_1 = compute_melting_heat(Sin_cell, Sout, Lin, Lout_1, H_1, LE_1, Qr_1, Qg_1)
 
                 # Итерация 2
-                Lout, Ts = compute_Lout(config["epsilon"], config["sigma"], ST, Qm_1)
+                Lout, Ts = compute_Lout(config["epsilon"], config["sigma"], ST, Qm_1, T2m_pt)
                 H, LE = compute_turbulent_heat(T2m_pt, Ts, aws_data['wind_speed'],
                                                aws_data['pressure'], aws_data['RH_AWS2'], z)
                 Qr = compute_rain_heat(T2m_pt, Ts, aws_data['precipitation'])
@@ -937,7 +963,8 @@ def run_glacier_model(config=CONFIG):
                     'Lnet': round(Lnet, 2),
                     'Rnet': round(Rnet, 2),
                     'T2m_AWS2': round(aws_data['T2m_AWS2'], 2),
-                    'T2m': round(T2m_pt, 2),
+                    'T2m': round(T2m_pt, 2), # для расчета альбедо
+                    'T2m_inst': round(T2m_inst, 2),  # температура в ячейке по времени (для расчета ост. показателей)
                     'Ts': round(Ts, 2),
                     'wind_speed': round(aws_data['wind_speed'], 2),
                     'RH': round(aws_data['RH_AWS2'], 2),
