@@ -450,6 +450,31 @@ def compute_pressure(p_aws1, z_cell, z_aws1, T_layer_mean):
     exponent = (z_cell - z_aws1) / denom
     return p_aws1 / (10.0 ** exponent)
 
+def compute_vapor_pressure(T2m_C, p_hpa, RH):
+    """
+    Формула 15: давление водяного пара во влажном воздухе, гПа.
+
+    e(z,t) = 6.112 * exp(17.62*T2m / (243.12 + T2m))
+             * (1.0016 + 0.0000315*p - 0.074/p)
+             * RH/100
+
+    Parameters
+    ----------
+    T2m_C : float – мгновенная T2m ячейки, °C   (ф.11, каждые 30 мин!)
+    p_hpa : float – давление в ячейке, гПа       (ф.14)
+    RH    : float – относительная влажность, %   (ф.12, = RH AWS2)
+    """
+    if p_hpa <= 0:
+        return 0.0
+
+    denom = 243.12 + T2m_C
+    if denom <= 0:          # защита от деления на 0 (нереалистичные T)
+        return 0.0
+
+    term1 = 6.112 * math.exp(17.62 * T2m_C / denom)          # насыщ. давление пара
+    term2 = 1.0016 + 0.0000315 * p_hpa - 0.074 / p_hpa       # поправка на давление
+    return term1 * term2 * (RH / 100.0)
+
 def compute_turbulent_heat(T2m_pt, Ts_C, wind_speed, pressure, RH, z,
                            z0m=0.001, z0t=0.0001, z0h=0.0001, zm=2.0):
     """Явный и латентный теплообмен"""
@@ -982,6 +1007,13 @@ def run_glacier_model(config=CONFIG):
                     aws1_data['pressure_AWS1'], z, config["z_aws1"], T_layer
                 )
 
+                # давление водяного пара
+                e_cell = compute_vapor_pressure(
+                    T2m_inst,  # ← мгновенная, НЕ суточная!
+                    pressure_cell,
+                    aws_data['RH_AWS2']
+                )
+
                 # Температура
                 T2m_pt  = daily_T2m_per_point.get(cat, 0.0)   # средняя суточная T в ячейке
 
@@ -1053,6 +1085,7 @@ def run_glacier_model(config=CONFIG):
                     'RH': round(aws_data['RH_AWS2'], 2),
                     'pressure_AWS1': round(aws1_data['pressure_AWS1'], 2),
                     'pressure': round(pressure_cell, 2),
+                    'e': round(e_cell, 4),
                     'H': round(H, 2),
                     'LE': round(LE, 2),
                     'Qr': round(Qr, 2),
