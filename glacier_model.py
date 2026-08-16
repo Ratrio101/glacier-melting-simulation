@@ -105,11 +105,12 @@ CONFIG = {
     "z_aws2": 2549,                         # высота метеостанции на леднике
     "L_fs": 330000,                         # скрытая теплота плавления снега
     "L_fi": 335000,                         # скрытая теплота плавления льда
+    "ws_min": 0.5,                          # мин. скорость ветра для расчёта Rib, м/с
+    "rib_cr": 0.4,                          # критическое число Ричардсона
     "latitude": 56.82,                      # широта
     "longitude": 117.33,                    # долгота
     "timezone": 9                           # часовой пояс
 }
-
 
 def ensure_dir(d):
     os.makedirs(d, exist_ok=True)
@@ -474,6 +475,19 @@ def compute_vapor_pressure(T2m_C, p_hpa, RH):
     term1 = 6.112 * math.exp(17.62 * T2m_C / denom)          # насыщ. давление пара
     term2 = 1.0016 + 0.0000315 * p_hpa - 0.074 / p_hpa       # поправка на давление
     return term1 * term2 * (RH / 100.0)
+
+def compute_richardson(T2m_C, Ts_C, wind_speed, zm=2.0, z0m=0.001, ws_min=0.5):
+    """
+    Формула 16: число Ричардсона (безразмерное).
+    """
+
+    if wind_speed <= ws_min:
+        return None
+
+    g = 9.81
+    T2m_K = T2m_C + 273.15
+
+    return g * (T2m_C - Ts_C) * (zm - z0m) / (T2m_K * wind_speed ** 2)
 
 def compute_turbulent_heat(T2m_pt, Ts_C, wind_speed, pressure, RH, z,
                            z0m=0.001, z0t=0.0001, z0h=0.0001, zm=2.0):
@@ -1045,6 +1059,10 @@ def run_glacier_model(config=CONFIG):
 
                 # Итерация 2
                 Lout, Ts = compute_Lout(config["epsilon"], config["sigma"], ST, Qm_1, T2m_pt)
+
+                # ---- число Ричардсона (ф.16) ----
+                rib = compute_richardson(T2m_inst, Ts, aws_data['wind_speed'], ws_min=config["ws_min"])
+
                 H, LE = compute_turbulent_heat(T2m_pt, Ts, aws_data['wind_speed'],
                                                pressure_cell, aws_data['RH_AWS2'], z)
                 Qr = compute_rain_heat(T2m_pt, Ts, aws_data['precipitation'])
@@ -1086,6 +1104,7 @@ def run_glacier_model(config=CONFIG):
                     'pressure_AWS1': round(aws1_data['pressure_AWS1'], 2),
                     'pressure': round(pressure_cell, 2),
                     'e': round(e_cell, 4),
+                    'Rib': round(rib, 4) if rib is not None else None,
                     'H': round(H, 2),
                     'LE': round(LE, 2),
                     'Qr': round(Qr, 2),

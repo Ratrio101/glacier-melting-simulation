@@ -426,13 +426,54 @@ def compute_Lout(epsilon, sigma, ST, Qm, T2m_cell_C):
     Ts_C_out = Ts_K - 273.15
     return Lout, Ts_C_out
 
-
 def compute_Rnet(Sin, Sout, Lin, Lout):
     """Радиационный баланс"""
     Snet = Sin - Sout
     Lnet = Lin - Lout
     return Snet + Lnet, Snet, Lnet
 
+def compute_pressure(p_aws1, z_cell, z_aws1, T_layer_mean):
+    """
+    Расчет давления:
+    p(z,t) = p(AWS1,t) / 10^((z - z_aws1) / (18400 * (1 + 0.003665 * T)))
+
+    Parameters
+    ----------
+    p_aws1       : float – давление на AWS1, гПа
+    z_cell       : float – высота ячейки, м
+    z_aws1       : float – высота AWS1, м  (2536)
+    T_layer_mean : float – средняя температура слоя воздух между AWS1 и ячейкой, °C
+    """
+    denom = 18400.0 * (1.0 + 0.003665 * T_layer_mean)
+    if abs(denom) < 1e-6:
+        return p_aws1
+    exponent = (z_cell - z_aws1) / denom
+    return p_aws1 / (10.0 ** exponent)
+
+def compute_vapor_pressure(T2m_C, p_hpa, RH):
+    """
+    Формула 15: давление водяного пара во влажном воздухе, гПа.
+
+    e(z,t) = 6.112 * exp(17.62*T2m / (243.12 + T2m))
+             * (1.0016 + 0.0000315*p - 0.074/p)
+             * RH/100
+
+    Parameters
+    ----------
+    T2m_C : float – мгновенная T2m ячейки, °C   (ф.11, каждые 30 мин!)
+    p_hpa : float – давление в ячейке, гПа       (ф.14)
+    RH    : float – относительная влажность, %   (ф.12, = RH AWS2)
+    """
+    if p_hpa <= 0:
+        return 0.0
+
+    denom = 243.12 + T2m_C
+    if denom <= 0:          # защита от деления на 0 (нереалистичные T)
+        return 0.0
+
+    term1 = 6.112 * math.exp(17.62 * T2m_C / denom)          # насыщ. давление пара
+    term2 = 1.0016 + 0.0000315 * p_hpa - 0.074 / p_hpa       # поправка на давление
+    return term1 * term2 * (RH / 100.0)
 
 def compute_turbulent_heat(T2m_pt, Ts_C, wind_speed, pressure, RH, z,
                            z0m=0.001, z0t=0.0001, z0h=0.0001, zm=2.0):
@@ -612,6 +653,63 @@ def load_aws_data(excel_file="Test_model.xlsx", sheet_name="AWS2_30min"):
         print(f"✗ Ошибка: {e}")
         return pd.DataFrame()
 
+def load_aws1_data(excel_file="Test_model.xlsx", sheet_name="AWS1_30min"):
+    """Загружает метеоданные AWS1 (морена). Нужны давление и T2m."""
+    try:
+        print(f"Загружаем AWS1 из {excel_file}, лист '{sheet_name}'...")
+        df = pd.read_excel(excel_file, sheet_name=sheet_name, header=2)
+
+        column_mapping = {
+            'T2m': 'T2m_AWS1', 'p': 'pressure_AWS1',
+        }
+        df = df.rename(columns=column_mapping)
+
+        if 'Дата&Время' in df.columns:
+            df['datetime'] = pd.to_datetime(df['Дата&Время'])
+
+        df = df.dropna(subset=['datetime']).sort_values('datetime').reset_index(drop=True)
+        print(f"✓ AWS1: загружено {len(df)} записей")
+        return df
+    except Exception as e:
+        print(f"⚠ AWS1 не загружен ({e}). Давление будет постоянным.")
+        return pd.DataFrame()
+
+def get_aws1_at_time(aws1_df, target_datetime):
+    """Извлекает давление и T2m с AWS1 для момента времени."""
+
+    def safe_float(v, d=0.0):
+        try:
+            return d if pd.isna(v) else float(v)
+        except:
+            return d
+
+    if aws1_df.empty:
+        return {'pressure_AWS1': 1013.25, 'T2m_AWS1': 5.0}
+
+    mask = aws1_df['datetime'] == target_datetime
+    if mask.any():
+        row = aws1_df[mask].iloc[0]
+        return {
+            'pressure_AWS1': safe_float(row.get('pressure_AWS1'), 1013.25),
+            'T2m_AWS1':      safe_float(row.get('T2m_AWS1'), 5.0),
+        }
+
+    before = aws1_df[aws1_df['datetime'] <= target_datetime]
+    after  = aws1_df[aws1_df['datetime'] >= target_datetime]
+    if len(before) > 0 and len(after) > 0:
+        rb, ra = before.iloc[-1], after.iloc[0]
+        tb, ta = rb['datetime'], ra['datetime']
+        w = ((target_datetime - tb).total_seconds()
+             / (ta - tb).total_seconds()) if ta != tb else 0.5
+        return {
+            'pressure_AWS1': safe_float(rb.get('pressure_AWS1'), 1013.25) * (1-w)
+                           + safe_float(ra.get('pressure_AWS1'), 1013.25) * w,
+            'T2m_AWS1':      safe_float(rb.get('T2m_AWS1'), 5.0) * (1-w)
+                           + safe_float(ra.get('T2m_AWS1'), 5.0) * w,
+        }
+
+    return {'pressure_AWS1': 1013.25, 'T2m_AWS1': 5.0}
+
 def get_aws_at_time(aws_df, target_datetime):
     """Получает метеоданные для времени"""
 
@@ -748,6 +846,7 @@ def run_glacier_model(config=CONFIG):
     if aws_df.empty:
         print("✗ Нет метеоданных!")
         return
+    aws1_df = load_aws1_data()
 
     # Вычисляем среднесуточные температуры на AWS2
     daily_mean_T2m = compute_daily_mean_temperatures(aws_df)
@@ -869,6 +968,7 @@ def run_glacier_model(config=CONFIG):
 
             # Метеоданные
             aws_data = get_aws_at_time(aws_df, current_time)
+            aws1_data = get_aws1_at_time(aws1_df, current_time)
 
             # r.sun
             G_values = {}
@@ -899,6 +999,21 @@ def run_glacier_model(config=CONFIG):
                 # мгновенная температура T2m в ячейке
                 T2m_inst = aws_data['T2m_AWS2'] + config["kt"] * (z - config["z_aws2"])
 
+                # Расчет давления
+                T_layer = compute_layer_mean_temperature(
+                    aws1_data['T2m_AWS1'], config["z_aws1"], z, config["kt"]
+                )
+                pressure_cell = compute_pressure(
+                    aws1_data['pressure_AWS1'], z, config["z_aws1"], T_layer
+                )
+
+                # давление водяного пара
+                e_cell = compute_vapor_pressure(
+                    T2m_inst,  # ← мгновенная, НЕ суточная!
+                    pressure_cell,
+                    aws_data['RH_AWS2']
+                )
+
                 # Температура
                 T2m_pt  = daily_T2m_per_point.get(cat, 0.0)   # средняя суточная T в ячейке
 
@@ -923,7 +1038,7 @@ def run_glacier_model(config=CONFIG):
                 # Итерация 1
                 Lout_1, Ts_1 = compute_Lout(config["epsilon"], config["sigma"], ST, 0, T2m_pt)
                 H_1, LE_1 = compute_turbulent_heat(T2m_pt, Ts_1, aws_data['wind_speed'],
-                                                   aws_data['pressure'], aws_data['RH_AWS2'], z)
+                                                   pressure_cell, aws_data['RH_AWS2'], z)
                 Qr_1 = compute_rain_heat(T2m_pt, Ts_1, aws_data['precipitation'])
                 Qg_1 = compute_ground_heat(ST, Ts_1)
                 Qm_1 = compute_melting_heat(Sin_cell, Sout, Lin, Lout_1, H_1, LE_1, Qr_1, Qg_1)
@@ -931,7 +1046,7 @@ def run_glacier_model(config=CONFIG):
                 # Итерация 2
                 Lout, Ts = compute_Lout(config["epsilon"], config["sigma"], ST, Qm_1, T2m_pt)
                 H, LE = compute_turbulent_heat(T2m_pt, Ts, aws_data['wind_speed'],
-                                               aws_data['pressure'], aws_data['RH_AWS2'], z)
+                                               pressure_cell, aws_data['RH_AWS2'], z)
                 Qr = compute_rain_heat(T2m_pt, Ts, aws_data['precipitation'])
                 Qg = compute_ground_heat(ST, Ts)
                 Rnet, Snet, Lnet = compute_Rnet(Sin_cell, Sout, Lin, Lout)
@@ -968,7 +1083,9 @@ def run_glacier_model(config=CONFIG):
                     'Ts': round(Ts, 2),
                     'wind_speed': round(aws_data['wind_speed'], 2),
                     'RH': round(aws_data['RH_AWS2'], 2),
-                    'pressure': round(aws_data['pressure'], 2),
+                    'pressure_AWS1': round(aws1_data['pressure_AWS1'], 2),
+                    'pressure': round(pressure_cell, 2),
+                    'e': round(e_cell, 4),
                     'H': round(H, 2),
                     'LE': round(LE, 2),
                     'Qr': round(Qr, 2),
