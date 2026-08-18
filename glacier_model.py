@@ -487,53 +487,50 @@ def compute_richardson(T2m_C, Ts_C, wind_speed, zm=2.0, z0m=0.001, ws_min=0.5):
     g = 9.81
     T2m_K = T2m_C + 273.15
 
+    if T2m_K <= 0:
+        return None
+
     return g * (T2m_C - Ts_C) * (zm - z0m) / (T2m_K * wind_speed ** 2)
 
-def compute_turbulent_heat(T2m_pt, Ts_C, wind_speed, pressure, RH, z,
-                           z0m=0.001, z0t=0.0001, z0h=0.0001, zm=2.0):
-    """Явный и латентный теплообмен"""
-    cp = 1005.0
-    rho0 = 1.225
-    p0 = 1013.25
-    k = 0.4
-    Lv = 2.83e6
-    e_s = 6.11
+def compute_turbulent_heat(T2m_C, Ts_C, wind_speed, pressure, RH, z,
+                           rib=None, e_air=None,
+                           z0m=0.001, z0t=0.0001, z0h=0.0001, zm=2.0,
+                           ws_min=0.5, rib_cr=0.4):
+    """Явное (ф.18) и скрытое (ф.19) тепло, устойчивость по Rib (ф.16–17)."""
+    cp, rho0, p0, k, Lv = 1005.0, 1.225, 1013.25, 0.4, 2.83e6
 
-    if wind_speed <= 0.3:
+    # Нет ветра (WS ≤ 0.5) — турбулентного обмена нет
+    if wind_speed <= ws_min:
         return 0.0, 0.0
 
-    T2m_K = T2m_pt + 273.15
-    delta_T = T2m_pt - Ts_C
+    if rib is None:
+        rib = compute_richardson(T2m_C, Ts_C, wind_speed, zm, z0m, ws_min)
 
-    # Число Ричардсона
-    Rib = (9.81 * delta_T * (zm - z0m)) / (T2m_K * wind_speed ** 2) if wind_speed > 0 else 0.0
-
-    if Rib >= 0.2:
+    # Rib ≥ Rib(cr) = 0.4 — турбулентность подавлена
+    if rib >= rib_cr:
         return 0.0, 0.0
 
-    # Функция устойчивости
-    if Rib > 0:
-        phi_inv = (1.0 - 5.0 * Rib) ** 2
+    # Безразмерные функции (ф.17)
+    if rib > 0:
+        phi_inv = (1.0 - 5.0 * rib) ** 2        # стабильные условия
     else:
-        phi_inv = (1.0 - 16.0 * Rib) ** 0.75
+        phi_inv = (1.0 - 16.0 * rib) ** 0.75    # нестабильные
 
     ln_m = math.log(zm / z0m)
     ln_t = math.log(zm / z0t)
     ln_h = math.log(zm / z0h)
 
-    # H
+    delta_T = T2m_C - Ts_C
+
+    # H — формула 18
     H = cp * rho0 * (pressure / p0) * (k ** 2) * wind_speed * delta_T * phi_inv / (ln_m * ln_t)
 
-    # LE
-    if T2m_pt < -80 or T2m_pt > 60:
-        e_air = 0.0
-    else:
-        term1 = 6.112 * math.exp(17.62 * T2m_pt / (243.12 + T2m_pt))
-        term2 = 1.0016 + 0.0000315 * pressure - 0.074 / pressure if pressure > 0 else 1.0
-        e_air = term1 * term2 * (RH / 100.0)
+    # LE — формула 19; e из ф.15 (передаётся), es — поверхность при 0°C, насыщение
+    if e_air is None:
+        e_air = compute_vapor_pressure(T2m_C, pressure, RH)
+    es = compute_vapor_pressure(0.0, pressure, 100.0)
 
-    delta_e = e_air - e_s
-    LE = 0.623 * Lv * rho0 * (1.0 / p0) * (k ** 2) * wind_speed * delta_e * phi_inv / (ln_m * ln_h)
+    LE = 0.623 * Lv * rho0 * (1.0 / p0) * (k ** 2) * wind_speed * (e_air - es) * phi_inv / (ln_m * ln_h)
 
     return H, LE
 
@@ -1051,9 +1048,15 @@ def run_glacier_model(config=CONFIG):
 
                 # Итерация 1
                 Lout_1, Ts_1 = compute_Lout(config["epsilon"], config["sigma"], ST, 0, T2m_pt)
-                H_1, LE_1 = compute_turbulent_heat(T2m_pt, Ts_1, aws_data['wind_speed'],
-                                                   pressure_cell, aws_data['RH_AWS2'], z)
-                Qr_1 = compute_rain_heat(T2m_pt, Ts_1, aws_data['precipitation'])
+                rib_1 = compute_richardson(T2m_inst, Ts_1, aws_data['wind_speed'],
+                                           ws_min=config["ws_min"])
+                H_1, LE_1 = compute_turbulent_heat(
+                    T2m_inst, Ts_1, aws_data['wind_speed'],
+                    pressure_cell, aws_data['RH_AWS2'], z,
+                    rib=rib_1, e_air=e_cell,
+                    ws_min=config["ws_min"], rib_cr=config["rib_cr"]
+                )
+                Qr_1 = compute_rain_heat(T2m_inst, Ts_1, aws_data['precipitation'])
                 Qg_1 = compute_ground_heat(ST, Ts_1)
                 Qm_1 = compute_melting_heat(Sin_cell, Sout, Lin, Lout_1, H_1, LE_1, Qr_1, Qg_1)
 
@@ -1063,8 +1066,12 @@ def run_glacier_model(config=CONFIG):
                 # ---- число Ричардсона (ф.16) ----
                 rib = compute_richardson(T2m_inst, Ts, aws_data['wind_speed'], ws_min=config["ws_min"])
 
-                H, LE = compute_turbulent_heat(T2m_pt, Ts, aws_data['wind_speed'],
-                                               pressure_cell, aws_data['RH_AWS2'], z)
+                H, LE = compute_turbulent_heat(
+                    T2m_inst, Ts, aws_data['wind_speed'],
+                    pressure_cell, aws_data['RH_AWS2'], z,
+                    rib=rib, e_air=e_cell,
+                    ws_min=config["ws_min"], rib_cr=config["rib_cr"]
+                )
                 Qr = compute_rain_heat(T2m_pt, Ts, aws_data['precipitation'])
                 Qg = compute_ground_heat(ST, Ts)
                 Rnet, Snet, Lnet = compute_Rnet(Sin_cell, Sout, Lin, Lout)
